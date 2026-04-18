@@ -12,18 +12,45 @@ use pi_ai_rs::{Content, ImageContent, Model};
 use crate::types::AgentMessage;
 
 use super::types::{
-    BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeProviderRequestEvent,
-    BoxFuture, CommandResult, CompactOptions, ContextEvent, ContextEventResult, ContextUsage,
-    CustomMessage, Extension, ExtensionCommandContext, ExtensionContext, ExtensionError,
-    ExtensionEvent, ExtensionFlag, ExtensionShortcut, ExtensionToolDefinition, InputEvent,
-    InputEventResult, NavigateTreeOptions, RegisteredCommand, ResourceDiagnostic, SessionInfo,
-    ToolCallEvent, ToolCallEventResult, ToolResultEvent, ToolResultEventResult, UserBashEvent,
-    UserBashEventResult,
+    BeforeAgentStartEvent, BeforeAgentStartEventResult,
+    BeforeProviderRequestEvent, BoxFuture, CommandResult, CompactOptions, ContextEvent,
+    ContextEventResult, ContextUsage, CustomMessage, Extension, ExtensionCommandContext,
+    ExtensionContext, ExtensionError, ExtensionEvent, ExtensionFlag, ExtensionShortcut,
+    ExtensionToolDefinition, InputEvent, InputEventResult, NavigateTreeOptions, RegisteredCommand,
+    ResolvedCommand, ResourceDiagnostic, SessionInfo, ToolCallEvent,
+    ToolCallEventResult, ToolResultEvent, ToolResultEventResult, UserBashEvent,
+    UserBashEventResult, MessageRenderer,
 };
 use crate::types::AgentTool;
 
 /// Error listener callback type.
 pub type ExtensionErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
+
+/// Runtime actions that get wired into the shared `ExtensionRuntime`.
+///
+/// Mirrors the TypeScript `ExtensionActions` interface.
+pub struct ExtensionActions {
+    pub send_message: Box<dyn Fn(CustomMessage, Option<super::types::SendMessageOptions>) + Send + Sync>,
+    pub send_user_message: Box<dyn Fn(super::types::UserMessageContent, Option<super::types::SendUserMessageOptions>) + Send + Sync>,
+    pub append_entry: Box<dyn Fn(&str, Option<serde_json::Value>) + Send + Sync>,
+    pub set_session_name: Box<dyn Fn(&str) + Send + Sync>,
+    pub get_session_name: Box<dyn Fn() -> Option<String> + Send + Sync>,
+    pub set_label: Box<dyn Fn(&str, Option<&str>) + Send + Sync>,
+    pub get_active_tools: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    pub get_all_tools: Box<dyn Fn() -> Vec<super::types::ToolInfo> + Send + Sync>,
+    pub set_active_tools: Box<dyn Fn(&[String]) + Send + Sync>,
+    pub refresh_tools: Box<dyn Fn() + Send + Sync>,
+    pub get_commands: Box<dyn Fn() -> Vec<super::types::SlashCommandInfo> + Send + Sync>,
+    pub set_model: Arc<dyn Fn(Model) -> BoxFuture<'static, bool> + Send + Sync>,
+    pub get_thinking_level: Box<dyn Fn() -> super::types::ThinkingLevel + Send + Sync>,
+    pub set_thinking_level: Box<dyn Fn(super::types::ThinkingLevel) + Send + Sync>,
+}
+
+/// Optional provider action overrides for `bind_core`.
+pub struct ProviderActions {
+    pub register_provider: Option<Box<dyn Fn(&str, super::types::ProviderConfig) + Send + Sync>>,
+    pub unregister_provider: Option<Box<dyn Fn(&str) + Send + Sync>>,
+}
 
 /// Context action callbacks provided by the host.
 ///
@@ -31,6 +58,7 @@ pub type ExtensionErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
 pub struct ExtensionContextActions {
     pub get_model: Arc<dyn Fn() -> Option<Model> + Send + Sync>,
     pub is_idle: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub get_signal: Arc<dyn Fn() -> Option<tokio_util::sync::CancellationToken> + Send + Sync>,
     pub abort: Arc<dyn Fn() + Send + Sync>,
     pub has_pending_messages: Arc<dyn Fn() -> bool + Send + Sync>,
     pub shutdown: Arc<dyn Fn() + Send + Sync>,
@@ -67,9 +95,12 @@ pub struct ExtensionRunner {
     cwd: String,
     session_info: SessionInfo,
     error_listeners: Vec<ExtensionErrorListener>,
+    /// Shared runtime — actions wired by bind_core.
+    runtime: Arc<super::types::ExtensionRuntime>,
     // Context action callbacks, set via bind_core — Arc for shared access in contexts
     get_model: Arc<dyn Fn() -> Option<Model> + Send + Sync>,
     is_idle_fn: Arc<dyn Fn() -> bool + Send + Sync>,
+    get_signal_fn: Arc<dyn Fn() -> Option<tokio_util::sync::CancellationToken> + Send + Sync>,
     abort_fn: Arc<dyn Fn() + Send + Sync>,
     has_pending_messages_fn: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown_fn: Arc<dyn Fn() + Send + Sync>,
@@ -98,8 +129,10 @@ impl ExtensionRunner {
             cwd,
             session_info,
             error_listeners: Vec::new(),
+            runtime: Arc::new(super::types::ExtensionRuntime::new()),
             get_model: Arc::new(|| None),
             is_idle_fn: Arc::new(|| true),
+            get_signal_fn: Arc::new(|| None),
             abort_fn: Arc::new(|| {}),
             has_pending_messages_fn: Arc::new(|| false),
             shutdown_fn: Arc::new(|| {}),
@@ -119,15 +152,91 @@ impl ExtensionRunner {
     }
 
     /// Bind core context actions — must be called before dispatching events.
-    pub fn bind_core(&mut self, actions: ExtensionContextActions) {
-        self.get_model = actions.get_model;
-        self.is_idle_fn = actions.is_idle;
-        self.abort_fn = actions.abort;
-        self.has_pending_messages_fn = actions.has_pending_messages;
-        self.shutdown_fn = actions.shutdown;
-        self.get_context_usage_fn = actions.get_context_usage;
-        self.compact_fn = actions.compact;
-        self.get_system_prompt_fn = actions.get_system_prompt;
+    ///
+    /// Mirrors the TypeScript `bindCore(actions, contextActions, providerActions)`.
+    /// Three parameter groups:
+    /// 1. `actions` — runtime actions wired into `ExtensionRuntime` (shared across extensions)
+    /// 2. `context_actions` — per-context callbacks used to build `ExtensionContext`
+    /// 3. `provider_actions` — optional provider register/unregister overrides
+    pub fn bind_core(
+        &mut self,
+        actions: ExtensionActions,
+        context_actions: ExtensionContextActions,
+        provider_actions: Option<ProviderActions>,
+    ) {
+        // Wire runtime actions (shared runtime all extensions read from)
+        if let Some(runtime) = Arc::get_mut(&mut self.runtime) {
+            runtime.send_message = actions.send_message;
+            runtime.send_user_message = actions.send_user_message;
+            runtime.append_entry = actions.append_entry;
+            runtime.set_session_name = actions.set_session_name;
+            runtime.get_session_name = actions.get_session_name;
+            runtime.set_label = actions.set_label;
+            runtime.get_active_tools = actions.get_active_tools;
+            runtime.get_all_tools = actions.get_all_tools;
+            runtime.set_active_tools = actions.set_active_tools;
+            runtime.refresh_tools = actions.refresh_tools;
+            runtime.get_commands = actions.get_commands;
+            runtime.set_model = actions.set_model;
+            runtime.get_thinking_level = actions.get_thinking_level;
+            runtime.set_thinking_level = actions.set_thinking_level;
+        }
+
+        // Context actions
+        self.get_model = context_actions.get_model;
+        self.is_idle_fn = context_actions.is_idle;
+        self.get_signal_fn = context_actions.get_signal;
+        self.abort_fn = context_actions.abort;
+        self.has_pending_messages_fn = context_actions.has_pending_messages;
+        self.shutdown_fn = context_actions.shutdown;
+        self.get_context_usage_fn = context_actions.get_context_usage;
+        self.compact_fn = context_actions.compact;
+        self.get_system_prompt_fn = context_actions.get_system_prompt;
+
+        // Flush provider registrations queued during extension loading
+        // Collect errors first, then emit them (avoids borrow conflict with runtime)
+        let mut flush_errors: Vec<ExtensionError> = Vec::new();
+        {
+            let pending = {
+                let mut lock = self.runtime.pending_provider_registrations.lock().unwrap();
+                std::mem::take(&mut *lock)
+            };
+            for reg in &pending {
+                if let Some(ref pa) = provider_actions {
+                    if let Some(ref register) = pa.register_provider {
+                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            register(&reg.name, reg.config.clone());
+                        })) {
+                            flush_errors.push(ExtensionError {
+                                extension_path: reg.extension_path.clone(),
+                                event: "register_provider".to_string(),
+                                error: format!("{e:?}"),
+                                stack: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for error in flush_errors {
+            self.emit_error(error);
+        }
+
+        // Wire provider registration for runtime use
+        if let Some(runtime) = Arc::get_mut(&mut self.runtime) {
+            if let Some(pa) = provider_actions {
+                if let Some(register) = pa.register_provider {
+                    runtime.register_provider = Box::new(move |name, config, _ext_path| {
+                        register(name, config);
+                    });
+                }
+                if let Some(unregister) = pa.unregister_provider {
+                    runtime.unregister_provider = Box::new(move |name, _ext_path| {
+                        unregister(name);
+                    });
+                }
+            }
+        }
     }
 
     /// Register an error listener.
@@ -178,18 +287,63 @@ impl ExtensionRunner {
         None
     }
 
-    /// Get all registered commands.
-    pub fn get_registered_commands(&self) -> Vec<&RegisteredCommand> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
+    /// Get all registered commands with resolved invocation names.
+    ///
+    /// Mirrors the TypeScript `getRegisteredCommands()` which calls
+    /// `resolveRegisteredCommands()` to assign unique invocation names.
+    pub fn get_registered_commands(&mut self) -> Vec<ResolvedCommand> {
+        self.command_diagnostics = Vec::new();
+        self.resolve_registered_commands()
+    }
+
+    /// Resolve commands with unique invocation names (disambiguates duplicates).
+    fn resolve_registered_commands(&self) -> Vec<ResolvedCommand> {
+        let mut commands: Vec<&RegisteredCommand> = Vec::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+
         for ext in &self.extensions {
-            for (name, cmd) in &ext.commands {
-                if seen.insert(name.clone()) {
-                    result.push(cmd);
-                }
+            for cmd in ext.commands.values() {
+                commands.push(cmd);
+                *counts.entry(cmd.name.clone()).or_insert(0) += 1;
             }
         }
-        result
+
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        commands
+            .into_iter()
+            .map(|command| {
+                let occurrence = {
+                    let entry = seen.entry(command.name.clone()).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+
+                let mut invocation_name = if counts.get(&command.name).copied().unwrap_or(0) > 1 {
+                    format!("{}:{}", command.name, occurrence)
+                } else {
+                    command.name.clone()
+                };
+
+                if taken.contains(&invocation_name) {
+                    let mut suffix = occurrence;
+                    loop {
+                        suffix += 1;
+                        invocation_name = format!("{}:{}", command.name, suffix);
+                        if !taken.contains(&invocation_name) {
+                            break;
+                        }
+                    }
+                }
+
+                taken.insert(invocation_name.clone());
+                ResolvedCommand {
+                    command: command.clone(),
+                    invocation_name,
+                }
+            })
+            .collect()
     }
 
     /// Get all registered shortcuts.
@@ -246,10 +400,17 @@ impl ExtensionRunner {
     }
 
     /// Get a command by name. Returns None if not found.
-    pub fn get_command(&self, name: &str) -> Option<&RegisteredCommand> {
+    pub fn get_command(&self, name: &str) -> Option<ResolvedCommand> {
+        self.resolve_registered_commands()
+            .into_iter()
+            .find(|c| c.invocation_name == name)
+    }
+
+    /// Get a message renderer for a custom message type.
+    pub fn get_message_renderer(&self, custom_type: &str) -> Option<&MessageRenderer> {
         for ext in &self.extensions {
-            if let Some(cmd) = ext.commands.get(name) {
-                return Some(cmd);
+            if let Some(renderer) = ext.message_renderers.get(custom_type) {
+                return Some(renderer);
             }
         }
         None
@@ -299,6 +460,7 @@ impl ExtensionRunner {
     /// Create an ExtensionContext for use in event handlers.
     fn create_context(&self) -> Arc<ExtensionContext> {
         let model = (self.get_model)();
+        let signal = (self.get_signal_fn)();
         let is_idle = self.is_idle_fn.clone();
         let abort = self.abort_fn.clone();
         let has_pending = self.has_pending_messages_fn.clone();
@@ -313,6 +475,7 @@ impl ExtensionRunner {
             session_info: self.session_info.clone(),
             model,
             is_idle: Box::new(move || is_idle()),
+            signal,
             abort: Box::new(move || abort()),
             has_pending_messages: Box::new(move || has_pending()),
             shutdown: Box::new(move || shutdown()),
@@ -373,6 +536,10 @@ impl ExtensionRunner {
     // ========================================================================
 
     /// Emit a tool_call event. Returns block/reason if any handler blocks.
+    ///
+    /// Note: Unlike other emit methods, this does NOT catch handler errors.
+    /// This matches the TypeScript `emitToolCall` which intentionally lets
+    /// errors propagate to the caller.
     pub async fn emit_tool_call(&self, event: ToolCallEvent) -> Option<ToolCallEventResult> {
         let ctx = self.create_context();
         let ext_event = ExtensionEvent::ToolCall(event);
@@ -385,27 +552,13 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match std::panic::AssertUnwindSafe(handler(ext_event.clone(), ctx.clone()))
-                    .catch_unwind()
-                    .await
-                {
-                    Ok(Some(val)) => {
-                        let handler_result: ToolCallEventResult =
-                            serde_json::from_value(val).unwrap_or_default();
-                        if handler_result.block == Some(true) {
-                            return Some(handler_result);
-                        }
-                        result = Some(handler_result);
+                if let Some(val) = handler(ext_event.clone(), ctx.clone()).await {
+                    let handler_result: ToolCallEventResult =
+                        serde_json::from_value(val).unwrap_or_default();
+                    if handler_result.block == Some(true) {
+                        return Some(handler_result);
                     }
-                    Ok(None) => {}
-                    Err(_panic) => {
-                        self.emit_error(ExtensionError {
-                            extension_path: ext.path.clone(),
-                            event: "tool_call".to_string(),
-                            error: "handler panicked".to_string(),
-                            stack: None,
-                        });
-                    }
+                    result = Some(handler_result);
                 }
             }
         }

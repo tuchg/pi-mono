@@ -41,9 +41,12 @@ pub struct ContextUsage {
 }
 
 /// Options for context compaction.
-#[derive(Debug, Clone, Default)]
 pub struct CompactOptions {
     pub custom_instructions: Option<String>,
+    /// Callback invoked when compaction completes.
+    pub on_complete: Option<Box<dyn Fn(serde_json::Value) + Send + Sync>>,
+    /// Callback invoked if compaction fails.
+    pub on_error: Option<Box<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Read-only session information.
@@ -103,6 +106,8 @@ pub struct ExtensionContext {
     pub model: Option<Model>,
     /// Whether the agent is idle (not streaming).
     pub is_idle: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Get current abort/cancellation signal.
+    pub signal: Option<tokio_util::sync::CancellationToken>,
     /// Abort the current agent operation.
     pub abort: Box<dyn Fn() + Send + Sync>,
     /// Whether there are queued messages waiting.
@@ -436,13 +441,32 @@ pub struct UserBashEvent {
     pub cwd: String,
 }
 
+/// Bash execution result, matching the TypeScript `BashResult`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BashResult {
+    /// Combined stdout + stderr output (sanitized, possibly truncated).
+    pub output: String,
+    /// Process exit code (None if killed/cancelled).
+    pub exit_code: Option<i32>,
+    /// Whether the command was cancelled via signal.
+    pub cancelled: bool,
+    /// Whether the output was truncated.
+    pub truncated: bool,
+    /// Path to temp file containing full output (if truncated).
+    pub full_output_path: Option<String>,
+}
+
+/// Bash operations that extensions can provide for custom execution.
+/// Opaque to the extension system — passed to the bash executor.
+pub type BashOperations = serde_json::Value;
+
 /// Result from user_bash event handler.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserBashEventResult {
-    /// Full replacement result if extension handled execution.
-    pub stdout: Option<String>,
-    pub stderr: Option<String>,
-    pub exit_code: Option<i32>,
+    /// Custom operations to use for execution.
+    pub operations: Option<BashOperations>,
+    /// Full replacement: extension handled execution, use this result.
+    pub result: Option<BashResult>,
 }
 
 // ============================================================================
@@ -605,6 +629,27 @@ pub struct ExtensionToolDefinition {
     pub parameters: serde_json::Value,
     /// Per-tool execution mode override.
     pub execution_mode: Option<ToolExecutionMode>,
+    /// Shell rendering mode: `"default"` (standard) or `"self"` (tool renders its own shell).
+    pub render_shell: Option<String>,
+}
+
+/// A registered tool bundled with its source information.
+///
+/// Mirrors the TypeScript `RegisteredTool` type.
+#[derive(Clone)]
+pub struct RegisteredTool {
+    pub definition: ExtensionToolDefinition,
+    pub source_info: SourceInfo,
+    pub execute: Arc<dyn AgentTool>,
+}
+
+impl std::fmt::Debug for RegisteredTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredTool")
+            .field("definition", &self.definition)
+            .field("source_info", &self.source_info)
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -615,22 +660,46 @@ pub struct ExtensionToolDefinition {
 #[derive(Clone)]
 pub struct RegisteredCommand {
     pub name: String,
+    pub source_info: SourceInfo,
     pub description: Option<String>,
-    pub extension_path: String,
+    /// Optional autocompletion handler for command arguments.
+    pub get_argument_completions: Option<Arc<
+        dyn Fn(String) -> BoxFuture<'static, Option<Vec<AutocompleteItem>>> + Send + Sync,
+    >>,
     /// The handler is invoked with (args, ctx).
     pub handler: Arc<
         dyn Fn(String, Arc<ExtensionContext>) -> BoxFuture<'static, ()> + Send + Sync,
     >,
 }
 
+/// An autocomplete suggestion returned from command argument completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutocompleteItem {
+    pub label: String,
+    pub value: String,
+    pub description: Option<String>,
+}
+
 impl std::fmt::Debug for RegisteredCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisteredCommand")
             .field("name", &self.name)
+            .field("source_info", &self.source_info)
             .field("description", &self.description)
-            .field("extension_path", &self.extension_path)
             .finish()
     }
+}
+
+/// A resolved command with a unique invocation name for dispatch.
+///
+/// When multiple extensions register the same command name, the runner
+/// disambiguates by appending `:N` suffixes.
+#[derive(Clone, Debug)]
+pub struct ResolvedCommand {
+    /// The original registered command.
+    pub command: RegisteredCommand,
+    /// The unique name used for invocation (may differ from `command.name`).
+    pub invocation_name: String,
 }
 
 // ============================================================================

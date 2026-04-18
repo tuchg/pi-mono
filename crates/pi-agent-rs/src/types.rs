@@ -56,7 +56,8 @@ impl AgentThinkingLevel {
 }
 
 /// Queue draining mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum QueueMode {
     /// Drain all pending messages at once.
     All,
