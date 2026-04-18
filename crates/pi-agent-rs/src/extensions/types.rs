@@ -144,9 +144,18 @@ pub struct ResourcesDiscoverEvent {
 /// Result from resources_discover event handler.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourcesDiscoverResult {
-    pub skill_paths: Option<Vec<String>>,
-    pub prompt_paths: Option<Vec<String>>,
-    pub theme_paths: Option<Vec<String>>,
+    pub skill_paths: Option<Vec<ResourcePath>>,
+    pub prompt_paths: Option<Vec<ResourcePath>>,
+    pub theme_paths: Option<Vec<ResourcePath>>,
+}
+
+/// A resource path with provenance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcePath {
+    /// The resource path.
+    pub path: String,
+    /// The extension that provided this resource.
+    pub extension_path: String,
 }
 
 // ============================================================================
@@ -208,13 +217,15 @@ pub struct SessionBeforeForkResult {
 /// Contains the preparation data, branch entries to summarize, and an
 /// optional abort signal handle. Extensions can cancel or provide a custom
 /// compaction result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionBeforeCompactEvent {
     /// Preparation data for the compaction.
     pub preparation: serde_json::Value,
     /// Branch entries that will be summarized.
     pub branch_entries: Vec<serde_json::Value>,
     pub custom_instructions: Option<String>,
+    /// Abort signal for the compaction operation.
+    pub signal: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -250,9 +261,11 @@ pub struct TreePreparation {
 }
 
 /// Fired before navigating in the session tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionBeforeTreeEvent {
     pub preparation: TreePreparation,
+    /// Abort signal for the tree navigation operation.
+    pub signal: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -770,6 +783,15 @@ pub struct ResourceDiagnostic {
     pub path: String,
 }
 
+/// A built-in keybinding entry used for conflict detection in `get_shortcuts`.
+#[derive(Debug, Clone)]
+pub struct BuiltinKeybinding {
+    /// Human-readable name of the keybinding.
+    pub name: String,
+    /// If true, extensions cannot override this keybinding.
+    pub restrict_override: bool,
+}
+
 /// Type of diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticType {
@@ -1012,7 +1034,7 @@ pub enum ThinkingLevel {
 }
 
 /// Configuration for registering a provider via `register_provider`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ProviderConfig {
     /// Base URL for the API endpoint.
     pub base_url: Option<String>,
@@ -1020,12 +1042,42 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     /// API type identifier.
     pub api: Option<String>,
+    /// Custom stream function for providers that need custom API handling.
+    pub stream_simple: Option<Arc<dyn Fn(Model, serde_json::Value) -> BoxFuture<'static, serde_json::Value> + Send + Sync>>,
     /// Custom headers to include in requests.
     pub headers: Option<HashMap<String, String>>,
     /// If true, adds Authorization: Bearer header with the resolved API key.
     pub auth_header: Option<bool>,
     /// Models to register. If provided, replaces all existing models for this provider.
     pub models: Option<Vec<ProviderModelConfig>>,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            api_key: None,
+            api: None,
+            stream_simple: None,
+            headers: None,
+            auth_header: None,
+            models: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("api", &self.api)
+            .field("stream_simple", &self.stream_simple.as_ref().map(|_| "..."))
+            .field("headers", &self.headers)
+            .field("auth_header", &self.auth_header)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// Configuration for a model within a provider.

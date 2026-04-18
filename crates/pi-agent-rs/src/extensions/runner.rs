@@ -13,13 +13,13 @@ use crate::types::AgentMessage;
 
 use super::types::{
     BeforeAgentStartEvent, BeforeAgentStartEventResult,
-    BeforeProviderRequestEvent, BoxFuture, CommandResult, CompactOptions, ContextEvent,
-    ContextEventResult, ContextUsage, CustomMessage, Extension, ExtensionCommandContext,
-    ExtensionContext, ExtensionError, ExtensionEvent, ExtensionFlag, ExtensionShortcut,
-    ExtensionToolDefinition, InputEvent, InputEventResult, NavigateTreeOptions, RegisteredCommand,
-    ResolvedCommand, ResourceDiagnostic, SessionInfo, ToolCallEvent,
-    ToolCallEventResult, ToolResultEvent, ToolResultEventResult, UserBashEvent,
-    UserBashEventResult, MessageRenderer,
+    BeforeProviderRequestEvent, BoxFuture, BuiltinKeybinding, CommandResult, CompactOptions,
+    ContextEvent, ContextEventResult, ContextUsage, CustomMessage, Extension,
+    ExtensionCommandContext, ExtensionContext, ExtensionError, ExtensionEvent, ExtensionFlag,
+    ExtensionShortcut, ExtensionToolDefinition, InputEvent, InputEventResult,
+    NavigateTreeOptions, RegisteredCommand, ResolvedCommand, ResourceDiagnostic, ResourcePath,
+    SessionInfo, ToolCallEvent, ToolCallEventResult, ToolResultEvent, ToolResultEventResult,
+    UserBashEvent, UserBashEventResult, MessageRenderer,
 };
 use crate::types::AgentTool;
 
@@ -346,18 +346,65 @@ impl ExtensionRunner {
             .collect()
     }
 
-    /// Get all registered shortcuts.
-    pub fn get_shortcuts(&self) -> Vec<&ExtensionShortcut> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
+    /// Get all registered shortcuts with conflict detection.
+    ///
+    /// `builtin_keybindings` maps normalized key IDs to whether they restrict override:
+    /// - `true` means the extension shortcut is skipped (built-in takes priority)
+    /// - `false` means a warning is emitted but the extension shortcut is used
+    ///
+    /// Mirrors the TypeScript `getShortcuts(resolvedKeybindings)`.
+    pub fn get_shortcuts(
+        &mut self,
+        builtin_keybindings: &HashMap<String, BuiltinKeybinding>,
+    ) -> HashMap<String, ExtensionShortcut> {
+        self.shortcut_diagnostics = Vec::new();
+        let mut extension_shortcuts: HashMap<String, ExtensionShortcut> = HashMap::new();
+
         for ext in &self.extensions {
             for (key, shortcut) in &ext.shortcuts {
-                if seen.insert(key.clone()) {
-                    result.push(shortcut);
+                let normalized_key = key.to_lowercase();
+
+                // Check against built-in keybindings
+                if let Some(builtin) = builtin_keybindings.get(&normalized_key) {
+                    if builtin.restrict_override {
+                        self.shortcut_diagnostics.push(ResourceDiagnostic {
+                            diagnostic_type: super::types::DiagnosticType::Warning,
+                            message: format!(
+                                "Extension shortcut '{}' from {} conflicts with built-in shortcut. Skipping.",
+                                key, shortcut.extension_path
+                            ),
+                            path: shortcut.extension_path.clone(),
+                        });
+                        continue;
+                    } else {
+                        self.shortcut_diagnostics.push(ResourceDiagnostic {
+                            diagnostic_type: super::types::DiagnosticType::Warning,
+                            message: format!(
+                                "Extension shortcut conflict: '{}' is built-in shortcut for {} and {}. Using {}.",
+                                key, builtin.name, shortcut.extension_path, shortcut.extension_path
+                            ),
+                            path: shortcut.extension_path.clone(),
+                        });
+                    }
                 }
+
+                // Check against other extension shortcuts
+                if let Some(existing) = extension_shortcuts.get(&normalized_key) {
+                    self.shortcut_diagnostics.push(ResourceDiagnostic {
+                        diagnostic_type: super::types::DiagnosticType::Warning,
+                        message: format!(
+                            "Extension shortcut conflict: '{}' registered by both {} and {}. Using {}.",
+                            key, existing.extension_path, shortcut.extension_path, shortcut.extension_path
+                        ),
+                        path: shortcut.extension_path.clone(),
+                    });
+                }
+
+                extension_shortcuts.insert(normalized_key, shortcut.clone());
             }
         }
-        result
+
+        extension_shortcuts
     }
 
     /// Get all extension paths.
@@ -888,6 +935,9 @@ impl ExtensionRunner {
     }
 
     /// Emit a resources_discover event and collect results.
+    ///
+    /// Each returned path is annotated with the extension that provided it,
+    /// matching the TypeScript behavior.
     pub async fn emit_resources_discover(
         &self,
         event: super::types::ResourcesDiscoverEvent,
@@ -908,26 +958,25 @@ impl ExtensionRunner {
                     .await
                 {
                     Ok(Some(val)) => {
-                        if let Ok(result) =
-                            serde_json::from_value::<super::types::ResourcesDiscoverResult>(val)
-                        {
-                            if let Some(paths) = result.skill_paths {
-                                combined
-                                    .skill_paths
-                                    .get_or_insert_with(Vec::new)
-                                    .extend(paths);
+                        // Handler returns raw paths as strings; we wrap them with extension provenance
+                        let extension_path = ext.path.clone();
+                        let map_paths = |paths: Vec<String>, ext_path: &str| -> Vec<ResourcePath> {
+                            paths.into_iter().map(|p| ResourcePath { path: p, extension_path: ext_path.to_string() }).collect()
+                        };
+
+                        if let Some(paths) = val.get("skillPaths").or_else(|| val.get("skill_paths")) {
+                            if let Ok(raw) = serde_json::from_value::<Vec<String>>(paths.clone()) {
+                                combined.skill_paths.get_or_insert_with(Vec::new).extend(map_paths(raw, &extension_path));
                             }
-                            if let Some(paths) = result.prompt_paths {
-                                combined
-                                    .prompt_paths
-                                    .get_or_insert_with(Vec::new)
-                                    .extend(paths);
+                        }
+                        if let Some(paths) = val.get("promptPaths").or_else(|| val.get("prompt_paths")) {
+                            if let Ok(raw) = serde_json::from_value::<Vec<String>>(paths.clone()) {
+                                combined.prompt_paths.get_or_insert_with(Vec::new).extend(map_paths(raw, &extension_path));
                             }
-                            if let Some(paths) = result.theme_paths {
-                                combined
-                                    .theme_paths
-                                    .get_or_insert_with(Vec::new)
-                                    .extend(paths);
+                        }
+                        if let Some(paths) = val.get("themePaths").or_else(|| val.get("theme_paths")) {
+                            if let Ok(raw) = serde_json::from_value::<Vec<String>>(paths.clone()) {
+                                combined.theme_paths.get_or_insert_with(Vec::new).extend(map_paths(raw, &extension_path));
                             }
                         }
                     }
