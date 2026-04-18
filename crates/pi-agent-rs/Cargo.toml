@@ -22,3 +22,5 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 typetag = { workspace = true }
 tokio-util = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }

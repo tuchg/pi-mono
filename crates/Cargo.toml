@@ -41,6 +41,10 @@ chrono = { version = "0.4", features = ["serde"] }
 typetag = "0.2"
 tokio-util = "0.7"
 
+# WASM Component Model
+wasmtime = { version = "43", features = ["component-model"] }
+wasmtime-wasi = "43"
+
 # Internal crates
 pi-ai-rs = { path = "pi-ai-rs" }
 pi-agent-rs = { path = "pi-agent-rs" }
