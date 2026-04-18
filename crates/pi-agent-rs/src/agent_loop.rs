@@ -3,7 +3,8 @@ use pi_ai_rs::event_stream::{event_stream, EventStream, EventStreamSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, Message,
+    AfterToolCallContext, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
+    AgentToolResult, BeforeToolCallContext, Message,
 };
 
 /// Sender half for agent event streams.
@@ -252,6 +253,57 @@ async fn run_loop(
                 let mut tool_results = Vec::new();
 
                 for tc in &tool_calls {
+                    // --- before_tool_call hook ---
+                    let blocked = if let Some(ref before) = config.before_tool_call {
+                        let before_ctx = BeforeToolCallContext {
+                            assistant_message: assistant.clone(),
+                            tool_call: tc.clone(),
+                            args: tc.arguments.clone(),
+                            context: context.clone(),
+                        };
+                        match (before)(before_ctx).await {
+                            Some(result) if result.block == Some(true) => {
+                                let reason = result
+                                    .reason
+                                    .unwrap_or_else(|| "Blocked by before_tool_call hook".to_string());
+                                Some(reason)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(reason) = blocked {
+                        // Tool was blocked — emit an error result without executing
+                        let err_content = vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
+                            text: format!("Tool call blocked: {reason}"),
+                            text_signature: None,
+                        })];
+                        let result_msg = pi_ai_rs::ToolResultMessage {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            content: err_content,
+                            details: None,
+                            is_error: true,
+                            timestamp: 0,
+                        };
+
+                        sender.push(AgentEvent::ToolExecutionEnd {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            result: serde_json::to_value(&result_msg).unwrap_or_default(),
+                            is_error: true,
+                        });
+
+                        let agent_result =
+                            AgentMessage::Standard(Message::ToolResult(result_msg.clone()));
+                        context.messages.push(agent_result.clone());
+                        new_messages.push(agent_result);
+                        tool_results.push(result_msg);
+                        continue;
+                    }
+
                     sender.push(AgentEvent::ToolExecutionStart {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
@@ -260,7 +312,7 @@ async fn run_loop(
 
                     // Look up the tool by name and execute it.
                     let tool = context.tools.iter().find(|t| t.name() == tc.name);
-                    let (result_content, result_details, is_error) = match tool {
+                    let (mut result_content, mut result_details, mut is_error) = match tool {
                         Some(tool) => {
                             match tool.execute(&tc.id, tc.arguments.clone(), None).await {
                                 Ok(result) => {
@@ -283,6 +335,32 @@ async fn run_loop(
                             (err_content, None, true)
                         }
                     };
+
+                    // --- after_tool_call hook ---
+                    if let Some(ref after) = config.after_tool_call {
+                        let after_ctx = AfterToolCallContext {
+                            assistant_message: assistant.clone(),
+                            tool_call: tc.clone(),
+                            args: tc.arguments.clone(),
+                            result: AgentToolResult {
+                                content: result_content.clone(),
+                                details: result_details.clone().unwrap_or(serde_json::Value::Null),
+                            },
+                            is_error,
+                            context: context.clone(),
+                        };
+                        if let Some(overrides) = (after)(after_ctx).await {
+                            if let Some(content) = overrides.content {
+                                result_content = content;
+                            }
+                            if let Some(details) = overrides.details {
+                                result_details = Some(details);
+                            }
+                            if let Some(err) = overrides.is_error {
+                                is_error = err;
+                            }
+                        }
+                    }
 
                     let result_msg = pi_ai_rs::ToolResultMessage {
                         tool_call_id: tc.id.clone(),
