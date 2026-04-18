@@ -6,13 +6,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use pi_ai_rs::{Content, ImageContent, Model};
 
 use crate::types::AgentMessage;
 
 use super::types::{
     BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeProviderRequestEvent,
-    ContextEvent, ContextEventResult, ContextUsage, Extension,
+    CompactOptions, ContextEvent, ContextEventResult, ContextUsage, CustomMessage, Extension,
     ExtensionContext, ExtensionError, ExtensionEvent, ExtensionShortcut,
     ExtensionToolDefinition, InputEvent, InputEventResult,
     RegisteredCommand, SessionInfo, ToolCallEvent, ToolCallEventResult, ToolResultEvent,
@@ -24,6 +25,8 @@ use crate::types::AgentTool;
 pub type ExtensionErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
 
 /// Context action callbacks provided by the host.
+///
+/// Mirrors the TypeScript `ExtensionContextActions` interface.
 pub struct ExtensionContextActions {
     pub get_model: Arc<dyn Fn() -> Option<Model> + Send + Sync>,
     pub is_idle: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -31,12 +34,16 @@ pub struct ExtensionContextActions {
     pub has_pending_messages: Arc<dyn Fn() -> bool + Send + Sync>,
     pub shutdown: Arc<dyn Fn() + Send + Sync>,
     pub get_context_usage: Arc<dyn Fn() -> Option<ContextUsage> + Send + Sync>,
+    pub compact: Arc<dyn Fn(Option<CompactOptions>) + Send + Sync>,
     pub get_system_prompt: Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 /// Combined result from all before_agent_start handlers.
 #[derive(Debug, Clone, Default)]
 pub struct BeforeAgentStartCombinedResult {
+    /// Custom messages collected from all handlers.
+    pub messages: Option<Vec<CustomMessage>>,
+    /// System prompt override (chained from all handlers).
     pub system_prompt: Option<String>,
 }
 
@@ -53,6 +60,7 @@ pub struct ExtensionRunner {
     has_pending_messages_fn: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown_fn: Arc<dyn Fn() + Send + Sync>,
     get_context_usage_fn: Arc<dyn Fn() -> Option<ContextUsage> + Send + Sync>,
+    compact_fn: Arc<dyn Fn(Option<CompactOptions>) + Send + Sync>,
     get_system_prompt_fn: Arc<dyn Fn() -> String + Send + Sync>,
     // Flag values (defaults set during registration, CLI values set after)
     flag_values: HashMap<String, serde_json::Value>,
@@ -72,6 +80,7 @@ impl ExtensionRunner {
             has_pending_messages_fn: Arc::new(|| false),
             shutdown_fn: Arc::new(|| {}),
             get_context_usage_fn: Arc::new(|| None),
+            compact_fn: Arc::new(|_| {}),
             get_system_prompt_fn: Arc::new(|| String::new()),
             flag_values: HashMap::new(),
         }
@@ -85,6 +94,7 @@ impl ExtensionRunner {
         self.has_pending_messages_fn = actions.has_pending_messages;
         self.shutdown_fn = actions.shutdown;
         self.get_context_usage_fn = actions.get_context_usage;
+        self.compact_fn = actions.compact;
         self.get_system_prompt_fn = actions.get_system_prompt;
     }
 
@@ -192,6 +202,7 @@ impl ExtensionRunner {
         let has_pending = self.has_pending_messages_fn.clone();
         let shutdown = self.shutdown_fn.clone();
         let get_usage = self.get_context_usage_fn.clone();
+        let compact = self.compact_fn.clone();
         let get_prompt = self.get_system_prompt_fn.clone();
 
         Arc::new(ExtensionContext {
@@ -204,6 +215,7 @@ impl ExtensionRunner {
             has_pending_messages: Box::new(move || has_pending()),
             shutdown: Box::new(move || shutdown()),
             get_context_usage: Box::new(move || get_usage()),
+            compact: Box::new(move |opts| compact(opts)),
             get_system_prompt: Box::new(move || get_prompt()),
         })
     }
@@ -216,6 +228,9 @@ impl ExtensionRunner {
     ///
     /// For events with dedicated emit methods (tool_call, tool_result, context,
     /// before_provider_request, etc.), use those methods instead for type safety.
+    ///
+    /// Error isolation: if a handler panics or returns an error, the error is
+    /// reported and subsequent handlers continue to execute.
     pub async fn emit(&self, event: ExtensionEvent) {
         let ctx = self.create_context();
         let event_type = event.event_type();
@@ -227,12 +242,24 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                let result = handler(event.clone(), ctx.clone()).await;
-
-                // For session_before_* events, check if cancelled
-                if let Some(val) = &result {
-                    if val.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
-                        return;
+                match std::panic::AssertUnwindSafe(handler(event.clone(), ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
+                        // For session_before_* events, check if cancelled
+                        if val.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: event_type.to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
                     }
                 }
             }
@@ -256,8 +283,11 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match handler(ext_event.clone(), ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(ext_event.clone(), ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         let handler_result: ToolCallEventResult =
                             serde_json::from_value(val).unwrap_or_default();
                         if handler_result.block == Some(true) {
@@ -265,7 +295,15 @@ impl ExtensionRunner {
                         }
                         result = Some(handler_result);
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "tool_call".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
@@ -290,8 +328,11 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match handler(ext_event.clone(), ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(ext_event.clone(), ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         // Apply field-level overrides (omit-means-keep)
                         if let Some(content) = val.get("content") {
                             if let Ok(c) = serde_json::from_value::<Vec<Content>>(content.clone()) {
@@ -308,7 +349,15 @@ impl ExtensionRunner {
                             modified = true;
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "tool_result".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
@@ -340,15 +389,26 @@ impl ExtensionRunner {
                     messages: current_messages.clone(),
                 });
 
-                match handler(event, ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(event, ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         if let Ok(result) = serde_json::from_value::<ContextEventResult>(val) {
                             if let Some(msgs) = result.messages {
                                 current_messages = msgs;
                             }
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "context".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
@@ -375,11 +435,22 @@ impl ExtensionRunner {
                     payload: current_payload.clone(),
                 });
 
-                match handler(event, ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(event, ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         current_payload = val;
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "before_provider_request".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
@@ -388,6 +459,9 @@ impl ExtensionRunner {
     }
 
     /// Emit a before_agent_start event. Returns combined result.
+    ///
+    /// Collects `message` values from all handlers and chains `system_prompt`
+    /// overrides, matching the TypeScript `emitBeforeAgentStart` behaviour.
     pub async fn emit_before_agent_start(
         &self,
         prompt: String,
@@ -395,6 +469,7 @@ impl ExtensionRunner {
         system_prompt: String,
     ) -> Option<BeforeAgentStartCombinedResult> {
         let ctx = self.create_context();
+        let mut messages: Vec<CustomMessage> = Vec::new();
         let mut current_system_prompt = system_prompt.clone();
         let mut system_prompt_modified = false;
 
@@ -411,28 +486,43 @@ impl ExtensionRunner {
                     system_prompt: current_system_prompt.clone(),
                 });
 
-                match handler(event, ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(event, ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         if let Ok(result) =
                             serde_json::from_value::<BeforeAgentStartEventResult>(val)
                         {
+                            if let Some(msg) = result.message {
+                                messages.push(msg);
+                            }
                             if let Some(sp) = result.system_prompt {
                                 current_system_prompt = sp;
                                 system_prompt_modified = true;
                             }
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "before_agent_start".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
 
-        if !system_prompt_modified {
+        if messages.is_empty() && !system_prompt_modified {
             return None;
         }
 
         Some(BeforeAgentStartCombinedResult {
-            system_prompt: Some(current_system_prompt),
+            messages: if messages.is_empty() { None } else { Some(messages) },
+            system_prompt: if system_prompt_modified { Some(current_system_prompt) } else { None },
         })
     }
 
@@ -448,13 +538,24 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match handler(ext_event.clone(), ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(ext_event.clone(), ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         if let Ok(result) = serde_json::from_value::<UserBashEventResult>(val) {
                             return Some(result);
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "user_bash".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
@@ -462,10 +563,17 @@ impl ExtensionRunner {
         None
     }
 
-    /// Emit an input event. Returns the first handler result.
+    /// Emit an input event. Transform chain with "handled" short-circuit.
+    ///
+    /// Mirrors the TypeScript `emitInput` which chains transform results and
+    /// short-circuits on "handled".
     pub async fn emit_input(&self, event: InputEvent) -> Option<InputEventResult> {
         let ctx = self.create_context();
-        let ext_event = ExtensionEvent::Input(event);
+        let original_text = event.text.clone();
+        let original_images = event.images.clone();
+        let mut current_text = event.text.clone();
+        let mut current_images = event.images.clone();
+        let source = event.source;
 
         for ext in &self.extensions {
             let handlers = match ext.handlers.get("input") {
@@ -474,33 +582,54 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match handler(ext_event.clone(), ctx.clone()).await {
-                    Some(val) => {
-                        // Parse the action field
+                let input_event = ExtensionEvent::Input(InputEvent {
+                    text: current_text.clone(),
+                    images: current_images.clone(),
+                    source,
+                });
+
+                match std::panic::AssertUnwindSafe(handler(input_event, ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         if let Some(action) = val.get("action").and_then(|v| v.as_str()) {
                             match action {
                                 "handled" => return Some(InputEventResult::Handled),
                                 "transform" => {
-                                    let text = val
-                                        .get("text")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let images = val.get("images").and_then(|v| {
-                                        serde_json::from_value::<Vec<ImageContent>>(v.clone()).ok()
-                                    });
-                                    return Some(InputEventResult::Transform { text, images });
+                                    if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+                                        current_text = text.to_string();
+                                    }
+                                    if let Some(imgs) = val.get("images") {
+                                        current_images = serde_json::from_value::<Vec<ImageContent>>(imgs.clone()).ok();
+                                    }
                                 }
-                                _ => return Some(InputEventResult::Continue),
+                                _ => {}
                             }
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "input".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }
 
-        None
+        // Return transform if text or images changed
+        if current_text != original_text || current_images != original_images {
+            Some(InputEventResult::Transform {
+                text: current_text,
+                images: current_images,
+            })
+        } else {
+            Some(InputEventResult::Continue)
+        }
     }
 
     /// Emit a resources_discover event and collect results.
@@ -519,8 +648,11 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                match handler(ext_event.clone(), ctx.clone()).await {
-                    Some(val) => {
+                match std::panic::AssertUnwindSafe(handler(ext_event.clone(), ctx.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Some(val)) => {
                         if let Ok(result) =
                             serde_json::from_value::<super::types::ResourcesDiscoverResult>(val)
                         {
@@ -544,7 +676,15 @@ impl ExtensionRunner {
                             }
                         }
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(_panic) => {
+                        self.emit_error(ExtensionError {
+                            extension_path: ext.path.clone(),
+                            event: "resources_discover".to_string(),
+                            error: "handler panicked".to_string(),
+                            stack: None,
+                        });
+                    }
                 }
             }
         }

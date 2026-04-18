@@ -377,6 +377,7 @@ impl PluginManager {
                 },
                 handlers,
                 tools: HashMap::new(),
+                message_renderers: HashMap::new(),
                 commands: HashMap::new(),
                 flags: HashMap::new(),
                 shortcuts: HashMap::new(),
