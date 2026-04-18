@@ -584,9 +584,12 @@ impl ExtensionRunner {
 
     /// Emit a tool_call event. Returns block/reason if any handler blocks.
     ///
-    /// Note: Unlike other emit methods, this does NOT catch handler errors.
+    /// # Panics
+    ///
+    /// Unlike other emit methods, this does NOT catch handler panics.
     /// This matches the TypeScript `emitToolCall` which intentionally lets
-    /// errors propagate to the caller.
+    /// errors propagate to the caller. The caller is expected to handle
+    /// errors at the agent loop level (e.g., turning them into tool error results).
     pub async fn emit_tool_call(&self, event: ToolCallEvent) -> Option<ToolCallEventResult> {
         let ctx = self.create_context();
         let ext_event = ExtensionEvent::ToolCall(event);
