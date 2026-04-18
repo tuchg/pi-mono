@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use std::sync::Arc;
+
 use pi_ai_rs::{
     AssistantMessage, AssistantMessageEvent,
     Content, Model,
@@ -200,12 +202,25 @@ pub trait AgentTool: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// The context visible to the agent loop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<AgentMessage>,
-    // Tools are stored as trait objects in the Agent; here we keep definitions only.
+    /// Tool JSON schemas sent to the LLM.
     pub tool_definitions: Vec<Tool>,
+    /// Executable tool instances (looked up by name during tool execution).
+    pub tools: Vec<Arc<dyn AgentTool>>,
+}
+
+impl std::fmt::Debug for AgentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContext")
+            .field("system_prompt", &self.system_prompt)
+            .field("messages", &self.messages)
+            .field("tool_definitions", &self.tool_definitions)
+            .field("tools", &self.tools.iter().map(|t| t.name()).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

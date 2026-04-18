@@ -216,3 +216,122 @@ async fn agent_end_contains_all_messages() {
 
     harness.cleanup();
 }
+
+/// A minimal tool used only for testing that returns a known string.
+struct EchoTool;
+
+impl pi_agent_rs::AgentTool for EchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn label(&self) -> &str {
+        "Echo"
+    }
+    fn description(&self) -> &str {
+        "Echoes a message"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" }
+            },
+            "required": ["message"]
+        })
+    }
+    fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: serde_json::Value,
+        _on_update: Option<pi_agent_rs::AgentToolUpdateCallback>,
+    ) -> pi_agent_rs::BoxFuture<'_, Result<pi_agent_rs::AgentToolResult, anyhow::Error>> {
+        Box::pin(async move {
+            let msg = params["message"].as_str().unwrap_or("").to_string();
+            Ok(pi_agent_rs::AgentToolResult {
+                content: vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
+                    text: format!("ECHOED:{msg}"),
+                    text_signature: None,
+                })],
+                details: serde_json::json!(null),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn tool_execution_runs_registered_tool() {
+    let mut harness = Harness::new();
+    harness.add_tool(std::sync::Arc::new(EchoTool));
+
+    harness.set_responses(vec![
+        faux_assistant_message_with_stop(
+            vec![faux_tool_call_with_id(
+                "echo-1",
+                "echo",
+                serde_json::json!({"message": "hello world"}),
+            )],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_text("done"),
+    ]);
+
+    let messages = harness.prompt("echo something").await;
+
+    // Find the tool result message
+    let tool_result = messages
+        .iter()
+        .find(|m| m.role() == "toolResult")
+        .expect("no tool result message");
+
+    let result_text = get_message_text(tool_result);
+    assert_eq!(result_text, "ECHOED:hello world");
+
+    // Verify tool_execution_end event has is_error = false
+    let end_events = harness.events_of_type("tool_execution_end");
+    assert_eq!(end_events.len(), 1);
+    if let pi_agent_rs::AgentEvent::ToolExecutionEnd { is_error, .. } = end_events[0] {
+        assert!(!is_error, "expected is_error=false for successful tool execution");
+    }
+
+    harness.cleanup();
+}
+
+#[tokio::test]
+async fn unknown_tool_returns_error_result() {
+    let mut harness = Harness::new();
+    // Don't register any tools
+
+    harness.set_responses(vec![
+        faux_assistant_message_with_stop(
+            vec![faux_tool_call_with_id(
+                "missing-1",
+                "nonexistent_tool",
+                serde_json::json!({}),
+            )],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_text("ok"),
+    ]);
+
+    let messages = harness.prompt("try missing tool").await;
+
+    let tool_result = messages
+        .iter()
+        .find(|m| m.role() == "toolResult")
+        .expect("no tool result message");
+
+    let result_text = get_message_text(tool_result);
+    assert!(
+        result_text.contains("Unknown tool"),
+        "expected 'Unknown tool' in result, got: {result_text}"
+    );
+
+    // Verify the tool execution end event has is_error = true
+    let end_events = harness.events_of_type("tool_execution_end");
+    assert_eq!(end_events.len(), 1);
+    if let pi_agent_rs::AgentEvent::ToolExecutionEnd { is_error, .. } = end_events[0] {
+        assert!(is_error, "expected is_error=true for unknown tool");
+    }
+
+    harness.cleanup();
+}

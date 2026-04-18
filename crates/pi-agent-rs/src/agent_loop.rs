@@ -258,17 +258,38 @@ async fn run_loop(
                         args: tc.arguments.clone(),
                     });
 
-                    // In the full implementation, tools are looked up and
-                    // executed here. For now we emit a placeholder result.
+                    // Look up the tool by name and execute it.
+                    let tool = context.tools.iter().find(|t| t.name() == tc.name);
+                    let (result_content, result_details, is_error) = match tool {
+                        Some(tool) => {
+                            match tool.execute(&tc.id, tc.arguments.clone(), None).await {
+                                Ok(result) => {
+                                    (result.content, Some(result.details), false)
+                                }
+                                Err(e) => {
+                                    let err_content = vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
+                                        text: format!("Tool execution error: {e}"),
+                                        text_signature: None,
+                                    })];
+                                    (err_content, None, true)
+                                }
+                            }
+                        }
+                        None => {
+                            let err_content = vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
+                                text: format!("Unknown tool: {}", tc.name),
+                                text_signature: None,
+                            })];
+                            (err_content, None, true)
+                        }
+                    };
+
                     let result_msg = pi_ai_rs::ToolResultMessage {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
-                        content: vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
-                            text: "tool not implemented".to_string(),
-                            text_signature: None,
-                        })],
-                        details: None,
-                        is_error: true,
+                        content: result_content,
+                        details: result_details,
+                        is_error,
                         timestamp: 0,
                     };
 
@@ -276,7 +297,7 @@ async fn run_loop(
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
                         result: serde_json::to_value(&result_msg).unwrap_or_default(),
-                        is_error: true,
+                        is_error,
                     });
 
                     let agent_result =

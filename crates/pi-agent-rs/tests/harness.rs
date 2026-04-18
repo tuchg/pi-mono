@@ -69,6 +69,7 @@ impl Harness {
             system_prompt: self.system_prompt.clone(),
             messages: Vec::new(),
             tool_definitions: tool_defs,
+            tools: self.tools.clone(),
         };
 
         let model = self.model.clone();

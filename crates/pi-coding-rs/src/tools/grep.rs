@@ -1,7 +1,7 @@
 use pi_agent_rs::types::{AgentTool, AgentToolResult, BoxFuture};
 use serde_json::json;
 
-/// Search file contents using regex patterns.
+/// Search file contents using regex patterns via `grep -rn`.
 pub struct GrepTool;
 
 impl AgentTool for GrepTool {
@@ -31,7 +31,7 @@ impl AgentTool for GrepTool {
                 },
                 "include": {
                     "type": "string",
-                    "description": "Glob pattern to filter files"
+                    "description": "Glob pattern to filter files (e.g. '*.rs')"
                 }
             },
             "required": ["pattern"]
@@ -45,16 +45,43 @@ impl AgentTool for GrepTool {
         _on_update: Option<pi_agent_rs::types::AgentToolUpdateCallback>,
     ) -> BoxFuture<'_, Result<AgentToolResult, anyhow::Error>> {
         Box::pin(async move {
-            let pattern = params["pattern"].as_str().unwrap_or("");
-            let _path = params["path"].as_str().unwrap_or(".");
+            let pattern = params["pattern"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing 'pattern' parameter"))?;
+            let path = params["path"].as_str().unwrap_or(".");
+            let include = params["include"].as_str();
 
-            // Placeholder — full implementation would use the `grep` crate
+            let mut cmd = tokio::process::Command::new("grep");
+            cmd.arg("-rn").arg("--color=never");
+
+            if let Some(glob) = include {
+                cmd.arg("--include").arg(glob);
+            }
+
+            cmd.arg("--").arg(pattern).arg(path);
+
+            let output = cmd.output().await?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            // grep exits 1 when no matches found — not an error
+            let exit_code = output.status.code().unwrap_or(-1);
+            if exit_code > 1 || (exit_code != 0 && !stderr.is_empty()) {
+                return Err(anyhow::anyhow!("grep failed (exit {exit_code}): {stderr}"));
+            }
+
+            let text = if stdout.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                stdout
+            };
+
             Ok(AgentToolResult {
                 content: vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
-                    text: format!("grep tool: pattern={pattern} (not yet implemented)"),
+                    text,
                     text_signature: None,
                 })],
-                details: json!(null),
+                details: json!({ "exitCode": exit_code }),
             })
         })
     }
