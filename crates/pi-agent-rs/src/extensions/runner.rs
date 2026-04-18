@@ -227,13 +227,6 @@ impl ExtensionRunner {
             };
 
             for handler in handlers {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // We can't catch_unwind across an await boundary, so we just invoke.
-                    // Error handling is done via the result.
-                })) {
-                    let _ = e; // suppress warning
-                }
-
                 let result = handler(event.clone(), ctx.clone()).await;
 
                 // For session_before_* events, check if cancelled
