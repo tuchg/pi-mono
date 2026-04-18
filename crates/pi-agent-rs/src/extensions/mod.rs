@@ -16,6 +16,6 @@ pub mod types;
 pub mod wasm;
 
 pub use builder::ExtensionBuilder;
-pub use runner::{ExtensionContextActions, ExtensionRunner};
+pub use runner::{ExtensionCommandContextActions, ExtensionContextActions, ExtensionRunner};
 pub use types::*;
 pub use wasm::{PluginConfig, PluginManager, WasmPlugin};

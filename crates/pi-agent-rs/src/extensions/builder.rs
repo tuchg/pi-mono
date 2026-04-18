@@ -13,11 +13,11 @@ use std::sync::Arc;
 use crate::types::AgentTool;
 
 use super::types::{
-    BoxFuture, CustomMessage, EventBus, Extension, ExtensionAPI, ExtensionFlag,
-    ExtensionRuntime, ExtensionShortcut, ExtensionToolDefinition, HandlerFn, MessageRenderer,
-    PendingProviderRegistration, ProviderConfig, RegisteredCommand, SendMessageOptions,
-    SendUserMessageOptions, SlashCommandInfo, SourceInfo, SourceType, ThinkingLevel, ToolInfo,
-    UserMessageContent,
+    BoxFuture, CustomMessage, EventBus, ExecOptions, ExecResult, Extension, ExtensionAPI,
+    ExtensionFlag, ExtensionRuntime, ExtensionShortcut, ExtensionToolDefinition, HandlerFn,
+    MessageRenderer, PendingProviderRegistration, ProviderConfig, RegisteredCommand,
+    SendMessageOptions, SendUserMessageOptions, SlashCommandInfo, SourceInfo, SourceType,
+    ThinkingLevel, ToolInfo, UserMessageContent,
 };
 use pi_ai_rs::Model;
 
@@ -168,6 +168,10 @@ impl ExtensionAPI for ExtensionBuilder {
 
     fn set_label(&self, entry_id: &str, label: Option<&str>) {
         (self.runtime.set_label)(entry_id, label);
+    }
+
+    fn exec(&self, command: &str, args: &[String], options: Option<ExecOptions>) -> BoxFuture<'static, ExecResult> {
+        (self.runtime.exec)(command, args, options)
     }
 
     fn get_active_tools(&self) -> Vec<String> {

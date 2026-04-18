@@ -199,8 +199,16 @@ pub struct SessionBeforeForkResult {
 }
 
 /// Fired before context compaction.
+///
+/// Contains the preparation data, branch entries to summarize, and an
+/// optional abort signal handle. Extensions can cancel or provide a custom
+/// compaction result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionBeforeCompactEvent {
+    /// Preparation data for the compaction.
+    pub preparation: serde_json::Value,
+    /// Branch entries that will be summarized.
+    pub branch_entries: Vec<serde_json::Value>,
     pub custom_instructions: Option<String>,
 }
 
@@ -214,6 +222,8 @@ pub struct SessionBeforeCompactResult {
 /// Fired after context compaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCompactEvent {
+    /// The compaction entry that was created.
+    pub compaction_entry: serde_json::Value,
     pub from_extension: bool,
 }
 
@@ -221,11 +231,23 @@ pub struct SessionCompactEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionShutdownEvent;
 
+/// Preparation data for tree navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreePreparation {
+    pub target_id: String,
+    pub old_leaf_id: Option<String>,
+    pub common_ancestor_id: Option<String>,
+    pub entries_to_summarize: Vec<serde_json::Value>,
+    pub user_wants_summary: bool,
+    pub custom_instructions: Option<String>,
+    pub replace_instructions: Option<bool>,
+    pub label: Option<String>,
+}
+
 /// Fired before navigating in the session tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionBeforeTreeEvent {
-    pub target_id: String,
-    pub custom_instructions: Option<String>,
+    pub preparation: TreePreparation,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -251,6 +273,8 @@ pub struct TreeSummary {
 pub struct SessionTreeEvent {
     pub new_leaf_id: Option<String>,
     pub old_leaf_id: Option<String>,
+    /// Branch summary entry created during navigation.
+    pub summary_entry: Option<serde_json::Value>,
     pub from_extension: Option<bool>,
 }
 
@@ -669,6 +693,57 @@ pub struct ExtensionError {
     pub stack: Option<String>,
 }
 
+/// A diagnostic warning or error about extension resources (shortcuts, commands).
+#[derive(Debug, Clone)]
+pub struct ResourceDiagnostic {
+    pub diagnostic_type: DiagnosticType,
+    pub message: String,
+    pub path: String,
+}
+
+/// Type of diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticType {
+    Warning,
+    Error,
+}
+
+/// Extended context for command handlers.
+///
+/// Includes session control methods only safe in user-initiated commands.
+/// Mirrors the TypeScript `ExtensionCommandContext`.
+pub struct ExtensionCommandContext {
+    /// Base context fields.
+    pub ctx: Arc<ExtensionContext>,
+    /// Wait for the agent to finish streaming.
+    pub wait_for_idle: Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    /// Start a new session.
+    pub new_session: Box<dyn Fn() -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    /// Fork from a specific entry.
+    pub fork: Box<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    /// Navigate to a different point in the session tree.
+    pub navigate_tree: Box<dyn Fn(String, Option<NavigateTreeOptions>) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    /// Switch to a different session file.
+    pub switch_session: Box<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    /// Reload extensions, skills, prompts, and themes.
+    pub reload: Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+}
+
+/// Result from session control commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommandResult {
+    pub cancelled: bool,
+}
+
+/// Options for `navigate_tree`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NavigateTreeOptions {
+    pub summarize: Option<bool>,
+    pub custom_instructions: Option<String>,
+    pub replace_instructions: Option<bool>,
+    pub label: Option<String>,
+}
+
 // ============================================================================
 // Loaded Extension
 // ============================================================================
@@ -745,6 +820,9 @@ pub trait ExtensionAPI: Send + Sync {
     /// Set or clear a label on an entry.
     fn set_label(&self, entry_id: &str, label: Option<&str>);
 
+    /// Execute a shell command.
+    fn exec(&self, command: &str, args: &[String], options: Option<ExecOptions>) -> BoxFuture<'static, ExecResult>;
+
     /// Get the list of currently active tool names.
     fn get_active_tools(&self) -> Vec<String>;
 
@@ -790,6 +868,24 @@ pub trait ExtensionAPI: Send + Sync {
 // ============================================================================
 // Action Types for ExtensionAPI
 // ============================================================================
+
+/// Options for executing shell commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecOptions {
+    /// Timeout in milliseconds.
+    pub timeout: Option<u64>,
+    /// Working directory.
+    pub cwd: Option<String>,
+}
+
+/// Result of executing a shell command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+    pub killed: bool,
+}
 
 /// Options for `send_message`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -925,6 +1021,7 @@ pub struct ExtensionRuntime {
     pub set_session_name: Box<dyn Fn(&str) + Send + Sync>,
     pub get_session_name: Box<dyn Fn() -> Option<String> + Send + Sync>,
     pub set_label: Box<dyn Fn(&str, Option<&str>) + Send + Sync>,
+    pub exec: Arc<dyn Fn(&str, &[String], Option<ExecOptions>) -> BoxFuture<'static, ExecResult> + Send + Sync>,
     pub get_active_tools: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     pub get_all_tools: Box<dyn Fn() -> Vec<ToolInfo> + Send + Sync>,
     pub set_active_tools: Box<dyn Fn(&[String]) + Send + Sync>,
@@ -975,6 +1072,10 @@ impl ExtensionRuntime {
             }),
             set_label: Box::new(|_, _| {
                 tracing::warn!("set_label called before runtime was bound");
+            }),
+            exec: Arc::new(|_, _, _| {
+                tracing::warn!("exec called before runtime was bound");
+                Box::pin(async { ExecResult::default() })
             }),
             get_active_tools: Box::new(|| {
                 tracing::warn!("get_active_tools called before runtime was bound");

@@ -13,11 +13,12 @@ use crate::types::AgentMessage;
 
 use super::types::{
     BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeProviderRequestEvent,
-    CompactOptions, ContextEvent, ContextEventResult, ContextUsage, CustomMessage, Extension,
-    ExtensionContext, ExtensionError, ExtensionEvent, ExtensionShortcut,
-    ExtensionToolDefinition, InputEvent, InputEventResult,
-    RegisteredCommand, SessionInfo, ToolCallEvent, ToolCallEventResult, ToolResultEvent,
-    ToolResultEventResult, UserBashEvent, UserBashEventResult,
+    BoxFuture, CommandResult, CompactOptions, ContextEvent, ContextEventResult, ContextUsage,
+    CustomMessage, Extension, ExtensionCommandContext, ExtensionContext, ExtensionError,
+    ExtensionEvent, ExtensionFlag, ExtensionShortcut, ExtensionToolDefinition, InputEvent,
+    InputEventResult, NavigateTreeOptions, RegisteredCommand, ResourceDiagnostic, SessionInfo,
+    ToolCallEvent, ToolCallEventResult, ToolResultEvent, ToolResultEventResult, UserBashEvent,
+    UserBashEventResult,
 };
 use crate::types::AgentTool;
 
@@ -36,6 +37,19 @@ pub struct ExtensionContextActions {
     pub get_context_usage: Arc<dyn Fn() -> Option<ContextUsage> + Send + Sync>,
     pub compact: Arc<dyn Fn(Option<CompactOptions>) + Send + Sync>,
     pub get_system_prompt: Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+/// Command-specific context actions.
+///
+/// Mirrors the TypeScript `ExtensionCommandContextActions` interface.
+/// Only needed for interactive mode where extension commands are invokable.
+pub struct ExtensionCommandContextActions {
+    pub wait_for_idle: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    pub new_session: Arc<dyn Fn() -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    pub fork: Arc<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    pub navigate_tree: Arc<dyn Fn(String, Option<NavigateTreeOptions>) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    pub switch_session: Arc<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    pub reload: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
 /// Combined result from all before_agent_start handlers.
@@ -62,6 +76,16 @@ pub struct ExtensionRunner {
     get_context_usage_fn: Arc<dyn Fn() -> Option<ContextUsage> + Send + Sync>,
     compact_fn: Arc<dyn Fn(Option<CompactOptions>) + Send + Sync>,
     get_system_prompt_fn: Arc<dyn Fn() -> String + Send + Sync>,
+    // Command-specific context actions, set via bind_command_context
+    wait_for_idle_fn: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    new_session_fn: Arc<dyn Fn() -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    fork_fn: Arc<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    navigate_tree_fn: Arc<dyn Fn(String, Option<NavigateTreeOptions>) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    switch_session_fn: Arc<dyn Fn(String) -> BoxFuture<'static, CommandResult> + Send + Sync>,
+    reload_fn: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    // Diagnostics
+    shortcut_diagnostics: Vec<ResourceDiagnostic>,
+    command_diagnostics: Vec<ResourceDiagnostic>,
     // Flag values (defaults set during registration, CLI values set after)
     flag_values: HashMap<String, serde_json::Value>,
 }
@@ -82,6 +106,14 @@ impl ExtensionRunner {
             get_context_usage_fn: Arc::new(|| None),
             compact_fn: Arc::new(|_| {}),
             get_system_prompt_fn: Arc::new(|| String::new()),
+            wait_for_idle_fn: Arc::new(|| Box::pin(async {})),
+            new_session_fn: Arc::new(|| Box::pin(async { CommandResult { cancelled: false } })),
+            fork_fn: Arc::new(|_| Box::pin(async { CommandResult { cancelled: false } })),
+            navigate_tree_fn: Arc::new(|_, _| Box::pin(async { CommandResult { cancelled: false } })),
+            switch_session_fn: Arc::new(|_| Box::pin(async { CommandResult { cancelled: false } })),
+            reload_fn: Arc::new(|| Box::pin(async {})),
+            shortcut_diagnostics: Vec::new(),
+            command_diagnostics: Vec::new(),
             flag_values: HashMap::new(),
         }
     }
@@ -192,6 +224,76 @@ impl ExtensionRunner {
     /// Request a graceful shutdown.
     pub fn shutdown(&self) {
         (self.shutdown_fn)();
+    }
+
+    /// Check if UI is available.
+    pub fn has_ui(&self) -> bool {
+        // No-op until UI context is added.
+        false
+    }
+
+    /// Get all flags from all extensions (first registration per name wins).
+    pub fn get_flags(&self) -> HashMap<String, ExtensionFlag> {
+        let mut all_flags = HashMap::new();
+        for ext in &self.extensions {
+            for (name, flag) in &ext.flags {
+                if !all_flags.contains_key(name) {
+                    all_flags.insert(name.clone(), flag.clone());
+                }
+            }
+        }
+        all_flags
+    }
+
+    /// Get a command by name. Returns None if not found.
+    pub fn get_command(&self, name: &str) -> Option<&RegisteredCommand> {
+        for ext in &self.extensions {
+            if let Some(cmd) = ext.commands.get(name) {
+                return Some(cmd);
+            }
+        }
+        None
+    }
+
+    /// Get shortcut diagnostics (warnings about conflicts, etc.).
+    pub fn get_shortcut_diagnostics(&self) -> &[ResourceDiagnostic] {
+        &self.shortcut_diagnostics
+    }
+
+    /// Get command diagnostics (warnings about conflicts, etc.).
+    pub fn get_command_diagnostics(&self) -> &[ResourceDiagnostic] {
+        &self.command_diagnostics
+    }
+
+    /// Create an ExtensionCommandContext for command handlers.
+    pub fn create_command_context(&self) -> ExtensionCommandContext {
+        let ctx = self.create_context();
+        let wait_idle = self.wait_for_idle_fn.clone();
+        let new_session = self.new_session_fn.clone();
+        let fork = self.fork_fn.clone();
+        let navigate = self.navigate_tree_fn.clone();
+        let switch = self.switch_session_fn.clone();
+        let reload = self.reload_fn.clone();
+
+        ExtensionCommandContext {
+            ctx,
+            wait_for_idle: Box::new(move || wait_idle()),
+            new_session: Box::new(move || new_session()),
+            fork: Box::new(move |entry_id| fork(entry_id)),
+            navigate_tree: Box::new(move |target_id, opts| navigate(target_id, opts)),
+            switch_session: Box::new(move |path| switch(path)),
+            reload: Box::new(move || reload()),
+        }
+    }
+
+    /// Bind command-specific context actions (session control, etc.).
+    pub fn bind_command_context(&mut self, actions: ExtensionCommandContextActions) {
+        self.wait_for_idle_fn = actions.wait_for_idle;
+        self.new_session_fn = actions.new_session;
+        self.fork_fn = actions.fork;
+        self.navigate_tree_fn = actions.navigate_tree;
+        self.switch_session_fn = actions.switch_session;
+        self.reload_fn = actions.reload;
     }
 
     /// Create an ExtensionContext for use in event handlers.
