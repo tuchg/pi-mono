@@ -1,0 +1,24 @@
+[package]
+name = "pi-agent-rs"
+description = "Agent runtime with tool calling and state management — Rust port of @mariozechner/pi-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pi-ai-rs = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+typetag = { workspace = true }
+tokio-util = { workspace = true }

@@ -38,3 +38,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# Rust
+crates/target/
