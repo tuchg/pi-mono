@@ -76,7 +76,7 @@ impl Harness {
         let config = AgentLoopConfig {
             model,
             stream_options: Default::default(),
-            convert_to_llm: Box::new(|messages: Vec<AgentMessage>| {
+            convert_to_llm: std::sync::Arc::new(|messages: Vec<AgentMessage>| {
                 Box::pin(async move {
                     messages
                         .into_iter()

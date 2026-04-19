@@ -176,8 +176,15 @@ pub trait AgentTool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
 
-    fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Sequential
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        None
+    }
+
+    /// Optional shim to normalize raw tool-call arguments before schema
+    /// validation.  Return `Some(normalized)` to replace the arguments, or
+    /// `None` to leave them unchanged.
+    fn prepare_arguments(&self, _args: serde_json::Value) -> Option<serde_json::Value> {
+        None
     }
 
     /// Execute the tool with the given arguments.
@@ -312,21 +319,24 @@ impl AgentEvent {
 // Agent loop config
 // ---------------------------------------------------------------------------
 
-/// Async callback types used in the loop config.
+/// Async callback types used in the loop config and stored on the Agent.
+///
+/// Using `Arc` instead of `Box` so that callbacks can be cloned when building
+/// a new `AgentLoopConfig` for each `prompt()` / `continue_()` call.
 pub type ConvertToLlmFn =
-    Box<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
+    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
 pub type TransformContextFn =
-    Box<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 pub type GetApiKeyFn =
-    Box<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+    Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 pub type GetMessagesFn =
-    Box<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
-pub type BeforeToolCallFn = Box<
+    Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+pub type BeforeToolCallFn = Arc<
     dyn Fn(BeforeToolCallContext) -> BoxFuture<'static, Option<BeforeToolCallResult>>
         + Send
         + Sync,
 >;
-pub type AfterToolCallFn = Box<
+pub type AfterToolCallFn = Arc<
     dyn Fn(AfterToolCallContext) -> BoxFuture<'static, Option<AfterToolCallResult>>
         + Send
         + Sync,
