@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{agent_loop, agent_loop_continue};
 use crate::types::{
-    AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentLoopConfig,
-    AgentMessage, AgentState, AgentTool, AfterToolCallFn, BeforeToolCallContext,
-    BeforeToolCallResult, BeforeToolCallFn, BoxFuture, ConvertToLlmFn, GetApiKeyFn,
+    AgentContext, AgentEvent, AgentLoopConfig,
+    AgentMessage, AgentState, AgentTool, AfterToolCallFn,
+    BeforeToolCallFn, BoxFuture, ConvertToLlmFn, GetApiKeyFn,
     GetMessagesFn, Message, QueueMode, StreamFn, ToolExecutionMode, TransformContextFn,
 };
 
