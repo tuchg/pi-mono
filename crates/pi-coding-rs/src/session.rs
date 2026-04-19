@@ -80,9 +80,10 @@ fn create_session_id() -> String {
 fn generate_id(contains: impl Fn(&str) -> bool) -> String {
     for _ in 0..100 {
         let full = uuid::Uuid::new_v4().to_string();
-        let id: String = full.chars().take(8).collect();
-        if !contains(&id) {
-            return id;
+        // UUID is ASCII so slicing bytes is safe
+        let id = &full[..8];
+        if !contains(id) {
+            return id.to_string();
         }
     }
     uuid::Uuid::new_v4().to_string()
@@ -265,37 +266,31 @@ pub fn get_latest_compaction_entry(entries: &[Value]) -> Option<&Value> {
 /// `leaf_id = None`  → use last entry
 /// `leaf_id = Some(id)` → walk from that entry (if not found, falls back to last)
 pub fn build_session_context(entries: &[Value], leaf_id: Option<&str>) -> SessionContext {
-    build_session_context_with_index(entries, leaf_id, None)
+    build_session_context_with_index(entries, leaf_id)
 }
 
-fn build_session_context_with_index(
-    entries: &[Value],
-    leaf_id: Option<&str>,
-    by_id_opt: Option<&HashMap<String, Value>>,
-) -> SessionContext {
-    let owned_map: HashMap<String, Value>;
-    let by_id: &HashMap<String, Value> = if let Some(m) = by_id_opt {
-        m
-    } else {
-        owned_map = entries
-            .iter()
-            .filter(|e| is_session_entry(e))
-            .map(|e| (entry_id(e).to_string(), e.clone()))
-            .collect();
-        &owned_map
-    };
+fn build_session_context_with_index(entries: &[Value], leaf_id: Option<&str>) -> SessionContext {
+    // Build a zero-clone index: borrowed &str keys, usize index into entries.
+    let by_id: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_session_entry(e))
+        .filter_map(|(i, e)| {
+            let id = entry_id(e);
+            if id.is_empty() { None } else { Some((id, i)) }
+        })
+        .collect();
 
     // Find leaf entry
     let leaf: &Value = if let Some(id) = leaf_id {
         by_id
             .get(id)
+            .map(|&i| &entries[i])
             .or_else(|| entries.iter().filter(|e| is_session_entry(e)).last())
     } else {
         entries.iter().filter(|e| is_session_entry(e)).last()
     }
-    .unwrap_or_else(|| {
-        return &Value::Null;
-    });
+    .unwrap_or(&Value::Null);
 
     if leaf.is_null() {
         return SessionContext {
@@ -305,16 +300,17 @@ fn build_session_context_with_index(
         };
     }
 
-    // Walk from leaf to root
+    // Walk from leaf to root, then reverse — O(N) instead of O(N²).
     let mut path: Vec<&Value> = vec![];
     let mut current = Some(leaf);
     while let Some(entry) = current {
         if entry.is_null() {
             break;
         }
-        path.insert(0, entry);
-        current = entry_parent_id(entry).and_then(|pid| by_id.get(pid));
+        path.push(entry);
+        current = entry_parent_id(entry).and_then(|pid| by_id.get(pid).map(|&i| &entries[i]));
     }
+    path.reverse();
 
     // Extract settings along path
     let mut thinking_level = "off".to_string();
@@ -522,18 +518,24 @@ fn is_valid_session_file(path: impl AsRef<Path>) -> bool {
 pub fn find_most_recent_session(session_dir: impl AsRef<Path>) -> Option<PathBuf> {
     let dir = session_dir.as_ref();
     let read = std::fs::read_dir(dir).ok()?;
+    // Collect (path, mtime) using DirEntry::metadata() — avoids a second stat per file.
     let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = read
         .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter(|p| is_valid_session_file(p))
-        .filter_map(|p| {
-            let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
-            Some((p, mtime))
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((path, mtime))
         })
         .collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    candidates.into_iter().next().map(|(p, _)| p)
+    // Validate lazily, stopping at the first valid file.
+    candidates
+        .into_iter()
+        .find(|(p, _)| is_valid_session_file(p))
+        .map(|(p, _)| p)
 }
 
 pub fn get_default_session_dir(cwd: &str) -> PathBuf {
@@ -566,11 +568,13 @@ pub struct SessionManager {
     flushed: bool,
     // All file entries including header
     file_entries: Vec<Value>,
-    // Index of non-header entries by id
-    by_id: HashMap<String, Value>,
+    // Index of non-header entries: id → index in file_entries
+    by_id: HashMap<String, usize>,
     labels_by_id: HashMap<String, String>,
     label_timestamps_by_id: HashMap<String, String>,
     leaf_id: Option<String>,
+    // Cached flag: true once an assistant message has been appended
+    has_assistant: bool,
 }
 
 impl SessionManager {
@@ -596,6 +600,7 @@ impl SessionManager {
             labels_by_id: HashMap::new(),
             label_timestamps_by_id: HashMap::new(),
             leaf_id: None,
+            has_assistant: false,
         };
 
         if persist && !session_dir.as_os_str().is_empty() && !session_dir.exists() {
@@ -793,6 +798,7 @@ impl SessionManager {
         self.labels_by_id.clear();
         self.label_timestamps_by_id.clear();
         self.leaf_id = None;
+        self.has_assistant = false;
         self.flushed = false;
 
         if self.persist {
@@ -810,14 +816,26 @@ impl SessionManager {
         self.labels_by_id.clear();
         self.label_timestamps_by_id.clear();
         self.leaf_id = None;
+        self.has_assistant = false;
 
-        for entry in &self.file_entries {
+        for (idx, entry) in self.file_entries.iter().enumerate() {
             if entry_type(entry) == "session" {
                 continue;
             }
             let id = entry_id(entry).to_string();
-            self.by_id.insert(id.clone(), entry.clone());
+            self.by_id.insert(id.clone(), idx);
             self.leaf_id = Some(id.clone());
+
+            if entry_type(entry) == "message" {
+                if entry
+                    .get("message")
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str())
+                    == Some("assistant")
+                {
+                    self.has_assistant = true;
+                }
+            }
 
             if entry_type(entry) == "label" {
                 let target_id = entry
@@ -851,34 +869,25 @@ impl SessionManager {
         let Some(ref path) = self.session_file else {
             return;
         };
-        let content: String = self
-            .file_entries
-            .iter()
-            .map(|e| serde_json::to_string(e).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        let _ = std::fs::write(path, content);
+        let file = match std::fs::File::create(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut writer = std::io::BufWriter::new(file);
+        for e in &self.file_entries {
+            let _ = writeln!(writer, "{}", serde_json::to_string(e).unwrap_or_default());
+        }
+        let _ = std::io::Write::flush(&mut writer);
     }
 
-    fn has_assistant(&self) -> bool {
-        self.file_entries.iter().any(|e| {
-            entry_type(e) == "message"
-                && e.get("message")
-                    .and_then(|m| m.get("role"))
-                    .and_then(|r| r.as_str())
-                    == Some("assistant")
-        })
-    }
-
-    fn persist_entry(&mut self, entry: &Value) {
+    fn persist_entry(&mut self, idx: usize) {
         if !self.persist {
             return;
         }
         let Some(ref path) = self.session_file else {
             return;
         };
-        if !self.has_assistant() {
+        if !self.has_assistant {
             // Not ready to flush yet
             self.flushed = false;
             return;
@@ -906,16 +915,17 @@ impl SessionManager {
                 Ok(f) => f,
                 Err(_) => return,
             };
-            let _ = writeln!(f, "{}", serde_json::to_string(entry).unwrap_or_default());
+            let _ = writeln!(f, "{}", serde_json::to_string(&self.file_entries[idx]).unwrap_or_default());
         }
     }
 
     fn append_entry(&mut self, entry: Value) {
         let id = entry_id(&entry).to_string();
-        self.file_entries.push(entry.clone());
-        self.by_id.insert(id.clone(), entry.clone());
+        let idx = self.file_entries.len();
+        self.file_entries.push(entry);
+        self.by_id.insert(id.clone(), idx);
         self.leaf_id = Some(id);
-        self.persist_entry(&entry);
+        self.persist_entry(idx);
     }
 
     fn make_base(&self) -> (String, Option<String>, String) {
@@ -954,16 +964,19 @@ impl SessionManager {
     }
 
     pub fn get_leaf_entry(&self) -> Option<&Value> {
-        self.leaf_id.as_ref().and_then(|id| self.by_id.get(id))
+        self.leaf_id
+            .as_ref()
+            .and_then(|id| self.by_id.get(id.as_str()).map(|&i| &self.file_entries[i]))
     }
 
     pub fn get_entry(&self, id: &str) -> Option<&Value> {
-        self.by_id.get(id)
+        self.by_id.get(id).map(|&i| &self.file_entries[i])
     }
 
     pub fn get_children(&self, parent_id: &str) -> Vec<&Value> {
         self.by_id
             .values()
+            .map(|&i| &self.file_entries[i])
             .filter(|e| entry_parent_id(e) == Some(parent_id))
             .collect()
     }
@@ -979,17 +992,19 @@ impl SessionManager {
             .and_then(|e| serde_json::from_value(e.clone()).ok())
     }
 
-    /// Returns all session entries (excludes header).
+    /// Iterate over session entries (excludes the header) without cloning.
+    pub fn entries_iter(&self) -> impl Iterator<Item = &Value> {
+        self.file_entries.iter().filter(|e| is_session_entry(e))
+    }
+
+    /// Returns all session entries (excludes header) as owned values.
     pub fn get_entries(&self) -> Vec<Value> {
-        self.file_entries
-            .iter()
-            .filter(|e| is_session_entry(e))
-            .cloned()
-            .collect()
+        self.entries_iter().cloned().collect()
     }
 
     pub fn get_session_name(&self) -> Option<String> {
-        for entry in self.get_entries().iter().rev() {
+        // Iterate file_entries directly in reverse — no clone needed.
+        for entry in self.file_entries.iter().rev() {
             if entry_type(entry) == "session_info" {
                 let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 return if name.trim().is_empty() {
@@ -1007,6 +1022,9 @@ impl SessionManager {
     // -------------------------------------------------------------------------
 
     pub fn append_message(&mut self, message: Value) -> String {
+        if message.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+            self.has_assistant = true;
+        }
         let (id, parent_id, timestamp) = self.make_base();
         let entry = serde_json::json!({
             "type": "message",
@@ -1176,14 +1194,15 @@ impl SessionManager {
         let mut path: Vec<Value> = vec![];
         let mut current_id = start_id.map(|s| s.to_string());
         while let Some(id) = &current_id {
-            match self.by_id.get(id.as_str()) {
+            match self.by_id.get(id.as_str()).map(|&i| &self.file_entries[i]) {
                 Some(entry) => {
-                    path.insert(0, entry.clone());
+                    path.push(entry.clone());
                     current_id = entry_parent_id(entry).map(|s| s.to_string());
                 }
                 None => break,
             }
         }
+        path.reverse();
         path
     }
 
@@ -1194,16 +1213,15 @@ impl SessionManager {
                 thinking_level: "off".to_string(),
                 model: None,
             },
-            Some(id) => {
-                let entries = self.get_entries();
-                build_session_context_with_index(&entries, Some(id.as_str()), Some(&self.by_id))
-            }
+            Some(id) => build_session_context_with_index(&self.file_entries, Some(id.as_str())),
         }
     }
 
     /// Get the session as a tree of nodes, with label information resolved.
     pub fn get_tree(&self) -> Vec<SessionTreeNode> {
-        let entries = self.get_entries();
+        // Use entries_iter() to avoid cloning all entries upfront; only clone per-node when
+        // building SessionTreeNode.entry.
+        let entries: Vec<&Value> = self.entries_iter().collect();
         let mut node_map: HashMap<String, SessionTreeNode> = HashMap::new();
 
         for entry in &entries {
@@ -1213,7 +1231,7 @@ impl SessionManager {
             node_map.insert(
                 id,
                 SessionTreeNode {
-                    entry: entry.clone(),
+                    entry: (*entry).clone(),
                     children: vec![],
                     label,
                     label_timestamp,
@@ -1302,7 +1320,8 @@ impl SessionManager {
         let root_ids: Vec<String> = order
             .iter()
             .filter(|id| {
-                let entry = &self.by_id[id.as_str()];
+                let idx = self.by_id[id.as_str()];
+                let entry = &self.file_entries[idx];
                 let pid = entry_parent_id(entry);
                 match pid {
                     None => true,
@@ -1473,7 +1492,7 @@ impl SessionManager {
             self.session_file = Some(new_file.clone());
             self.build_index();
 
-            let has_assistant = self.has_assistant();
+            let has_assistant = self.has_assistant;
             if has_assistant {
                 self.rewrite_file();
                 self.flushed = true;
