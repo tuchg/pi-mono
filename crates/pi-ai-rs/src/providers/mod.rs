@@ -1,4 +1,11 @@
+pub mod anthropic_shared;
+pub mod bedrock_shared;
 pub mod faux;
+pub mod github_copilot_headers;
+pub mod google_shared;
+pub mod mistral_shared;
+pub mod openai_completions_shared;
+pub mod openai_responses_shared;
 pub mod simple_options;
 pub mod transform_messages;
 
