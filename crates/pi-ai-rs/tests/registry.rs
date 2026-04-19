@@ -10,12 +10,12 @@ fn noop_provider(api: &str) -> ApiProvider {
         api: api.to_string(),
         stream: Arc::new(|_model, _ctx, _opts| {
             let (mut s, r) = create_assistant_message_event_stream();
-            s.end(pi_ai_rs::AssistantMessage::default());
+            s.end(Some(pi_ai_rs::AssistantMessage::default()));
             r
         }),
         stream_simple: Arc::new(|_model, _ctx, _opts| {
             let (mut s, r) = create_assistant_message_event_stream();
-            s.end(pi_ai_rs::AssistantMessage::default());
+            s.end(Some(pi_ai_rs::AssistantMessage::default()));
             r
         }),
     }

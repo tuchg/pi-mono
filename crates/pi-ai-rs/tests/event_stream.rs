@@ -48,7 +48,7 @@ async fn event_stream_end_sends_result() {
     );
 
     sender.push("a".to_string());
-    sender.end("final".to_string());
+    sender.end(Some("final".to_string()));
 
     // Drop the sender explicitly to close the channel
     drop(sender);

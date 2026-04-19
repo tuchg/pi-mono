@@ -20,7 +20,7 @@ pub fn map_bedrock_stop_reason(reason: Option<&str>) -> StopReason {
     match reason {
         Some("end_turn") => StopReason::Stop,
         Some("tool_use") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::Length,
+        Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::Length,
         Some("stop_sequence") => StopReason::Stop,
         Some("content_filtered") => StopReason::Error,
         _ => StopReason::Error,
@@ -60,6 +60,58 @@ pub fn default_thinking_budget(level: ThinkingLevel) -> u32 {
 }
 
 // =============================================================================
+// Model capability checks
+// =============================================================================
+
+/// Check if the model supports thinking signatures in reasoningContent.
+/// Only Anthropic Claude models support the signature field.
+fn supports_thinking_signature(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    id.contains("anthropic.claude") || id.contains("anthropic/claude")
+}
+
+/// Check if the model supports prompt caching.
+/// Supported: Claude 3.5 Haiku, Claude 3.7 Sonnet, Claude 4.x models.
+pub fn supports_prompt_caching(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    if !id.contains("claude") {
+        return std::env::var("AWS_BEDROCK_FORCE_CACHE")
+            .map_or(false, |v| v == "1");
+    }
+    // Claude 4.x models
+    if id.contains("-4-") || id.contains("-4.") {
+        return true;
+    }
+    // Claude 3.7 Sonnet
+    if id.contains("claude-3-7-sonnet") {
+        return true;
+    }
+    // Claude 3.5 Haiku
+    if id.contains("claude-3-5-haiku") {
+        return true;
+    }
+    false
+}
+
+// =============================================================================
+// Tool call ID normalization
+// =============================================================================
+
+/// Normalize tool call IDs to match Bedrock constraints.
+/// Sanitizes to `[a-zA-Z0-9_-]` and truncates to 64 characters.
+fn normalize_tool_call_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
+// =============================================================================
 // Message conversion
 // =============================================================================
 
@@ -72,7 +124,9 @@ pub fn convert_bedrock_messages(
     cache_retention: CacheRetention,
 ) -> Vec<serde_json::Value> {
     let normalize_fn: NormalizeToolCallIdFn =
-        Box::new(|id: &str, _m: &Model, _s: &AssistantMessage| -> String { id.to_string() });
+        Box::new(|id: &str, _m: &Model, _s: &AssistantMessage| -> String {
+            normalize_tool_call_id(id)
+        });
     let transformed = transform_messages(&context.messages, model, Some(&normalize_fn));
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -119,34 +173,53 @@ pub fn convert_bedrock_messages(
                 }));
             }
             crate::types::Message::Assistant(assistant_msg) => {
-                let is_same_model =
+                let _is_same_model =
                     assistant_msg.provider == model.provider && assistant_msg.model == model.id;
                 let mut content: Vec<serde_json::Value> = Vec::new();
 
                 for block in &assistant_msg.content {
                     match block {
                         AssistantContent::Thinking(t) => {
-                            if t.redacted.is_some_and(|v| v) {
-                                if is_same_model {
-                                    content.push(serde_json::json!({
+                            // Skip empty thinking blocks
+                            if t.thinking.trim().is_empty() {
+                                continue;
+                            }
+                            if supports_thinking_signature(model) {
+                                // Claude models: require signature for proper replay.
+                                // If signature is missing/empty, fall back to plain text
+                                // since Bedrock rejects reasoning without a valid signature.
+                                let has_sig = t.thinking_signature
+                                    .as_ref()
+                                    .map_or(false, |s| !s.trim().is_empty());
+                                if has_sig {
+                                    let mut reasoning = serde_json::json!({
                                         "reasoningContent": {
-                                            "redactedContent": t.thinking_signature.as_deref().unwrap_or(""),
+                                            "reasoningText": {
+                                                "text": sanitize_surrogates(&t.thinking),
+                                                "signature": t.thinking_signature.as_deref().unwrap_or(""),
+                                            },
                                         }
-                                    }));
+                                    });
+                                    // Handle redacted content if present
+                                    if t.redacted.is_some_and(|v| v) {
+                                        reasoning = serde_json::json!({
+                                            "reasoningContent": {
+                                                "redactedContent": t.thinking_signature.as_deref().unwrap_or(""),
+                                            }
+                                        });
+                                    }
+                                    content.push(reasoning);
+                                } else {
+                                    content.push(serde_json::json!({"text": sanitize_surrogates(&t.thinking)}));
                                 }
-                            } else if is_same_model {
-                                let mut reasoning = serde_json::json!({
+                            } else {
+                                // Non-Claude models: send reasoningText without signature.
+                                // These models reject the signature field.
+                                content.push(serde_json::json!({
                                     "reasoningContent": {
                                         "reasoningText": {"text": sanitize_surrogates(&t.thinking)},
                                     }
-                                });
-                                if let Some(ref sig) = t.thinking_signature {
-                                    reasoning["reasoningContent"]["signature"] =
-                                        serde_json::Value::String(sig.clone());
-                                }
-                                content.push(reasoning);
-                            } else if !t.thinking.trim().is_empty() {
-                                content.push(serde_json::json!({"text": sanitize_surrogates(&t.thinking)}));
+                                }));
                             }
                         }
                         AssistantContent::Text(text_block) => {

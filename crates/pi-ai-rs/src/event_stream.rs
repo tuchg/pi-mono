@@ -12,33 +12,53 @@ use crate::types::{AssistantMessage, AssistantMessageEvent};
 
 /// Sender half — used by the producer (provider / agent loop) to push events.
 pub struct EventStreamSender<T: Send + 'static, R: Send + 'static = T> {
-    tx: mpsc::UnboundedSender<T>,
+    tx: Option<mpsc::UnboundedSender<T>>,
     result_tx: Option<oneshot::Sender<R>>,
     is_complete: Box<dyn Fn(&T) -> bool + Send>,
     extract_result: Box<dyn Fn(T) -> R + Send>,
+    done: bool,
 }
 
 impl<T: Clone + Send + 'static, R: Send + 'static> EventStreamSender<T, R> {
     /// Push an event to consumers. If the event is terminal the stream is
     /// closed automatically and the final result is forwarded.
+    /// Pushes after the stream is done are silently dropped (matches TS).
     pub fn push(&mut self, event: T) {
+        if self.done {
+            return;
+        }
+
         if (self.is_complete)(&event) {
+            self.done = true;
             let result = (self.extract_result)(event.clone());
-            let _ = self.tx.send(event);
+            if let Some(ref tx) = self.tx {
+                let _ = tx.send(event);
+            }
             if let Some(tx) = self.result_tx.take() {
                 let _ = tx.send(result);
             }
-        } else {
-            let _ = self.tx.send(event);
+            // Close the channel so the receiver stream terminates.
+            self.tx.take();
+        } else if let Some(ref tx) = self.tx {
+            let _ = tx.send(event);
         }
     }
 
-    /// Explicitly end the stream with a result (e.g. after an external loop
-    /// finishes). If a terminal event already triggered, this is a no-op.
-    pub fn end(&mut self, result: R) {
-        if let Some(tx) = self.result_tx.take() {
-            let _ = tx.send(result);
+    /// Explicitly end the stream with an optional result (e.g. after an
+    /// external loop finishes). If a terminal event already triggered, this is
+    /// a no-op. Matches the TS signature where `result` is optional.
+    pub fn end(&mut self, result: Option<R>) {
+        if self.done {
+            return;
         }
+        self.done = true;
+        if let Some(result) = result {
+            if let Some(tx) = self.result_tx.take() {
+                let _ = tx.send(result);
+            }
+        }
+        // Close the channel so the receiver stream terminates.
+        self.tx.take();
     }
 }
 
@@ -86,10 +106,11 @@ where
     let (result_tx, result_rx) = oneshot::channel();
 
     let sender = EventStreamSender {
-        tx,
+        tx: Some(tx),
         result_tx: Some(result_tx),
         is_complete: Box::new(is_complete),
         extract_result: Box::new(extract_result),
+        done: false,
     };
 
     let receiver = EventStream {
