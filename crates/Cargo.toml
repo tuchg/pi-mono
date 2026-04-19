@@ -40,6 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 typetag = "0.2"
 tokio-util = "0.7"
+regex = "1"
 
 # WASM Component Model
 wasmtime = { version = "43", features = ["component-model"] }

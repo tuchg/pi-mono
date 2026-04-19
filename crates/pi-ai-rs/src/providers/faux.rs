@@ -92,11 +92,17 @@ pub fn faux_assistant_text(text: &str) -> AssistantMessage {
 // ---------------------------------------------------------------------------
 
 /// Definition used to configure models in the faux provider.
+///
+/// Port of `FauxModelDefinition` from `packages/ai/src/providers/faux.ts`.
 #[derive(Debug, Clone)]
 pub struct FauxModelDefinition {
     pub id: String,
     pub name: Option<String>,
     pub reasoning: bool,
+    pub input: Option<Vec<InputModality>>,
+    pub cost: Option<ModelCost>,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
 }
 
 impl Default for FauxModelDefinition {
@@ -105,6 +111,10 @@ impl Default for FauxModelDefinition {
             id: "faux-1".to_string(),
             name: None,
             reasoning: false,
+            input: None,
+            cost: None,
+            context_window: None,
+            max_tokens: None,
         }
     }
 }
@@ -118,10 +128,13 @@ fn make_faux_model(api: &str, provider: &str, def: &FauxModelDefinition) -> Mode
         provider: provider.to_string(),
         base_url: "http://localhost:0".to_string(),
         reasoning: def.reasoning,
-        input: vec![InputModality::Text, InputModality::Image],
-        cost: ModelCost::default(),
-        context_window: 128_000,
-        max_tokens: 16_384,
+        input: def
+            .input
+            .clone()
+            .unwrap_or_else(|| vec![InputModality::Text, InputModality::Image]),
+        cost: def.cost.clone().unwrap_or_default(),
+        context_window: def.context_window.unwrap_or(128_000),
+        max_tokens: def.max_tokens.unwrap_or(16_384),
         headers: None,
         compat: None,
         supported_thinking_levels: None,
@@ -230,6 +243,12 @@ impl FauxProvider {
                         content_index: i,
                         partial: response.clone(),
                     });
+                    // Emit a delta with the full JSON arguments (mirrors TS chunked behavior).
+                    sender.push(AssistantMessageEvent::ToolcallDelta {
+                        content_index: i,
+                        delta: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        partial: response.clone(),
+                    });
                     sender.push(AssistantMessageEvent::ToolcallEnd {
                         content_index: i,
                         tool_call: tc.clone(),
@@ -336,9 +355,15 @@ impl FauxProviderRegistration {
 }
 
 /// Options for [`register_faux_provider`].
+///
+/// Port of `RegisterFauxProviderOptions` from `packages/ai/src/providers/faux.ts`.
 #[derive(Debug, Clone, Default)]
 pub struct RegisterFauxProviderOptions {
     pub models: Option<Vec<FauxModelDefinition>>,
+    /// Custom API identifier. Defaults to a generated UUID.
+    pub api: Option<String>,
+    /// Custom provider name. Defaults to `"faux"`.
+    pub provider: Option<String>,
 }
 
 /// Register a faux provider in the global API registry and return a
@@ -349,8 +374,10 @@ pub fn register_faux_provider(
     options: RegisterFauxProviderOptions,
 ) -> FauxProviderRegistration {
     let source_id = format!("faux-{}", uuid::Uuid::new_v4());
-    let api = format!("faux-{}", uuid::Uuid::new_v4());
-    let provider_name = "faux";
+    let api = options
+        .api
+        .unwrap_or_else(|| format!("faux-{}", uuid::Uuid::new_v4()));
+    let provider_name = options.provider.as_deref().unwrap_or("faux");
 
     let model_defs = options.models.unwrap_or_else(|| vec![FauxModelDefinition::default()]);
     let models: Vec<Model> = model_defs

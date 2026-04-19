@@ -1,4 +1,6 @@
 pub mod faux;
+pub mod simple_options;
+pub mod transform_messages;
 
 use crate::event_stream::AssistantMessageEventStreamReceiver;
 use crate::types::{Context, Model, SimpleStreamOptions, StreamOptions};

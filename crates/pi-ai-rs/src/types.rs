@@ -188,6 +188,25 @@ pub enum InputModality {
 // Content types
 // ---------------------------------------------------------------------------
 
+/// Decoded text signature (version 1).
+///
+/// Port of `TextSignatureV1` from `packages/ai/src/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextSignatureV1 {
+    pub v: u32,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<TextSignaturePhase>,
+}
+
+/// Possible phase values inside a [`TextSignatureV1`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSignaturePhase {
+    Commentary,
+    FinalAnswer,
+}
+
 /// Text content within a message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
