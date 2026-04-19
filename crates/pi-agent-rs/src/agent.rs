@@ -432,12 +432,12 @@ impl Agent {
             ));
         }
 
-        let last_role = self
-            .state
-            .messages
-            .last()
-            .map(|m| m.role())
-            .unwrap_or("");
+        let last_msg = self.state.messages.last();
+        if last_msg.is_none() {
+            return Err(anyhow::anyhow!("No messages to continue from"));
+        }
+
+        let last_role = last_msg.map(|m| m.role()).unwrap_or("");
 
         if last_role == "assistant" {
             // Drain steering/follow-up queues first (mirrors TS `continue()` logic).
