@@ -66,10 +66,11 @@ pub fn from_claude_code_name(name: &str, tools: Option<&[Tool]>) -> String {
 /// Map Anthropic stop reason string to our StopReason.
 pub fn map_anthropic_stop_reason(reason: &str) -> StopReason {
     match reason {
-        "end_turn" | "stop_sequence" => StopReason::Stop,
+        "end_turn" | "stop_sequence" | "pause_turn" => StopReason::Stop,
         "max_tokens" => StopReason::Length,
         "tool_use" => StopReason::ToolUse,
-        _ => StopReason::Error,
+        "refusal" | "sensitive" => StopReason::Error,
+        other => panic!("Unhandled stop reason: {other}"),
     }
 }
 
@@ -176,9 +177,22 @@ pub fn get_anthropic_cache_control(
 // Message conversion
 // =============================================================================
 
+/// Normalize tool call IDs to match Anthropic's required pattern and length.
+fn normalize_tool_call_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Convert internal messages to Anthropic API format.
 ///
-/// Port of the message conversion logic from `buildParams()` in
+/// Port of the message conversion logic from `convertMessages()` in
 /// `packages/ai/src/providers/anthropic.ts`.
 pub fn convert_anthropic_messages(
     model: &Model,
@@ -190,30 +204,49 @@ pub fn convert_anthropic_messages(
 ) {
     let normalize_fn: NormalizeToolCallIdFn =
         Box::new(|id: &str, _target_model: &Model, _source: &AssistantMessage| -> String {
-            id.to_string()
+            normalize_tool_call_id(id)
         });
 
     let transformed_messages = transform_messages(&context.messages, model, Some(&normalize_fn));
 
-    // System prompt as Anthropic system blocks
-    let system_blocks = context.system_prompt.as_ref().map(|prompt| {
-        vec![serde_json::json!({
+    // System prompt as Anthropic system blocks.
+    // For OAuth tokens, prepend Claude Code identity.
+    let system_blocks = if is_oauth {
+        let mut blocks = vec![serde_json::json!({
             "type": "text",
-            "text": sanitize_surrogates(prompt),
-        })]
-    });
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        })];
+        if let Some(ref prompt) = context.system_prompt {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": sanitize_surrogates(prompt),
+            }));
+        }
+        Some(blocks)
+    } else {
+        context.system_prompt.as_ref().map(|prompt| {
+            vec![serde_json::json!({
+                "type": "text",
+                "text": sanitize_surrogates(prompt),
+            })]
+        })
+    };
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
-    for msg in &transformed_messages {
+    let mut i = 0;
+    while i < transformed_messages.len() {
+        let msg = &transformed_messages[i];
         match msg {
             crate::types::Message::User(user) => {
                 match &user.content {
                     crate::types::UserContent::Text(text) => {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": sanitize_surrogates(text),
-                        }));
+                        if !text.trim().is_empty() {
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": sanitize_surrogates(text),
+                            }));
+                        }
                     }
                     crate::types::UserContent::Parts(parts) => {
                         let has_images = parts
@@ -231,19 +264,25 @@ pub fn convert_anthropic_messages(
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": sanitize_surrogates(&text),
-                            }));
+                            if !text.trim().is_empty() {
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": sanitize_surrogates(&text),
+                                }));
+                            }
                         } else {
-                            let content: Vec<serde_json::Value> = parts
+                            let mut content: Vec<serde_json::Value> = parts
                                 .iter()
                                 .filter_map(|p| match p {
                                     crate::types::UserContentPart::Text(t) => {
-                                        Some(serde_json::json!({
-                                            "type": "text",
-                                            "text": sanitize_surrogates(&t.text),
-                                        }))
+                                        if t.text.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(serde_json::json!({
+                                                "type": "text",
+                                                "text": sanitize_surrogates(&t.text),
+                                            }))
+                                        }
                                     }
                                     crate::types::UserContentPart::Image(img) => {
                                         if model.input.contains(&InputModality::Image) {
@@ -261,46 +300,58 @@ pub fn convert_anthropic_messages(
                                     }
                                 })
                                 .collect();
-                            messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": content,
-                            }));
+                            // Filter images when model doesn't support them
+                            if !model.input.contains(&InputModality::Image) {
+                                content.retain(|b| b["type"] != "image");
+                            }
+                            if !content.is_empty() {
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": content,
+                                }));
+                            }
                         }
                     }
                 }
             }
             crate::types::Message::Assistant(assistant_msg) => {
                 let mut content: Vec<serde_json::Value> = Vec::new();
-                let is_same_model =
-                    assistant_msg.provider == model.provider && assistant_msg.model == model.id;
 
                 for block in &assistant_msg.content {
                     match block {
                         AssistantContent::Thinking(t) => {
                             if t.redacted.is_some_and(|v| v) {
-                                if is_same_model {
+                                // Redacted thinking: pass the opaque payload back
+                                content.push(serde_json::json!({
+                                    "type": "redacted_thinking",
+                                    "data": t.thinking_signature.as_deref().unwrap_or(""),
+                                }));
+                            } else {
+                                if t.thinking.trim().is_empty() {
+                                    continue;
+                                }
+                                // If thinking signature is missing/empty (e.g., from
+                                // aborted stream), convert to plain text block to
+                                // avoid API rejection.
+                                let sig = t.thinking_signature.as_deref().unwrap_or("");
+                                if sig.trim().is_empty() {
                                     content.push(serde_json::json!({
-                                        "type": "redacted_thinking",
-                                        "data": t.thinking_signature.as_deref().unwrap_or(""),
+                                        "type": "text",
+                                        "text": sanitize_surrogates(&t.thinking),
+                                    }));
+                                } else {
+                                    content.push(serde_json::json!({
+                                        "type": "thinking",
+                                        "thinking": sanitize_surrogates(&t.thinking),
+                                        "signature": sig,
                                     }));
                                 }
-                            } else if is_same_model {
-                                let mut block_json = serde_json::json!({
-                                    "type": "thinking",
-                                    "thinking": sanitize_surrogates(&t.thinking),
-                                });
-                                if let Some(ref sig) = t.thinking_signature {
-                                    block_json["signature"] = serde_json::Value::String(sig.clone());
-                                }
-                                content.push(block_json);
-                            } else if !t.thinking.trim().is_empty() {
-                                content.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": sanitize_surrogates(&t.thinking),
-                                }));
                             }
                         }
                         AssistantContent::Text(text_block) => {
+                            if text_block.text.trim().is_empty() {
+                                continue;
+                            }
                             content.push(serde_json::json!({
                                 "type": "text",
                                 "text": sanitize_surrogates(&text_block.text),
@@ -330,71 +381,98 @@ pub fn convert_anthropic_messages(
                 }
             }
             crate::types::Message::ToolResult(tr) => {
-                let text_content: Vec<&TextContent> = tr
-                    .content
-                    .iter()
-                    .filter_map(|c| {
-                        if let Content::Text(t) = c {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let text_result: String =
-                    text_content.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
-                let has_images = tr.content.iter().any(|c| matches!(c, Content::Image(_)));
+                // Collect all consecutive toolResult messages into a single
+                // user message (needed for z.ai Anthropic endpoint).
+                let mut tool_results: Vec<serde_json::Value> = Vec::new();
 
-                let content = if has_images && model.input.contains(&InputModality::Image) {
-                    let mut blocks: Vec<serde_json::Value> = Vec::new();
-                    if !text_result.is_empty() {
-                        blocks.push(serde_json::json!({
-                            "type": "text",
-                            "text": sanitize_surrogates(&text_result),
-                        }));
-                    }
-                    for block in &tr.content {
-                        if let Content::Image(img) = block {
-                            blocks.push(serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.mime_type,
-                                    "data": img.data,
-                                }
-                            }));
-                        }
-                    }
-                    if blocks.iter().all(|b| b["type"] != "text") {
-                        blocks.insert(
-                            0,
-                            serde_json::json!({"type": "text", "text": "(see attached image)"}),
-                        );
-                    }
-                    serde_json::json!(blocks)
-                } else {
-                    let text = if text_result.is_empty() {
-                        "(no output)".to_string()
+                tool_results.push(build_tool_result_block(tr, model));
+
+                // Look ahead for consecutive toolResult messages
+                while i + 1 < transformed_messages.len() {
+                    if let crate::types::Message::ToolResult(next_tr) =
+                        &transformed_messages[i + 1]
+                    {
+                        tool_results.push(build_tool_result_block(next_tr, model));
+                        i += 1;
                     } else {
-                        sanitize_surrogates(&text_result)
-                    };
-                    serde_json::json!(text)
-                };
+                        break;
+                    }
+                }
 
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tr.tool_call_id,
-                        "content": content,
-                        "is_error": tr.is_error,
-                    }],
+                    "content": tool_results,
                 }));
             }
         }
+        i += 1;
     }
 
     (system_blocks, messages)
+}
+
+/// Build a single `tool_result` content block from a `ToolResultMessage`.
+fn build_tool_result_block(
+    tr: &crate::types::ToolResultMessage,
+    model: &Model,
+) -> serde_json::Value {
+    let text_content: Vec<&TextContent> = tr
+        .content
+        .iter()
+        .filter_map(|c| {
+            if let Content::Text(t) = c {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let text_result: String =
+        text_content.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
+    let has_images = tr.content.iter().any(|c| matches!(c, Content::Image(_)));
+
+    let content = if has_images && model.input.contains(&InputModality::Image) {
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        if !text_result.is_empty() {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": sanitize_surrogates(&text_result),
+            }));
+        }
+        for block in &tr.content {
+            if let Content::Image(img) = block {
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.mime_type,
+                        "data": img.data,
+                    }
+                }));
+            }
+        }
+        if blocks.iter().all(|b| b["type"] != "text") {
+            blocks.insert(
+                0,
+                serde_json::json!({"type": "text", "text": "(see attached image)"}),
+            );
+        }
+        serde_json::json!(blocks)
+    } else {
+        let text = if text_result.is_empty() {
+            "(no output)".to_string()
+        } else {
+            sanitize_surrogates(&text_result)
+        };
+        serde_json::json!(text)
+    };
+
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": tr.tool_call_id,
+        "content": content,
+        "is_error": tr.is_error,
+    })
 }
 
 /// Convert internal tools to Anthropic format.
@@ -440,9 +518,21 @@ mod tests {
     #[test]
     fn map_stop_reason() {
         assert_eq!(map_anthropic_stop_reason("end_turn"), StopReason::Stop);
+        assert_eq!(map_anthropic_stop_reason("stop_sequence"), StopReason::Stop);
+        assert_eq!(map_anthropic_stop_reason("pause_turn"), StopReason::Stop);
         assert_eq!(map_anthropic_stop_reason("max_tokens"), StopReason::Length);
         assert_eq!(map_anthropic_stop_reason("tool_use"), StopReason::ToolUse);
-        assert_eq!(map_anthropic_stop_reason("unknown"), StopReason::Error);
+        assert_eq!(map_anthropic_stop_reason("refusal"), StopReason::Error);
+        assert_eq!(map_anthropic_stop_reason("sensitive"), StopReason::Error);
+    }
+
+    #[test]
+    fn normalize_tool_call_id_basic() {
+        assert_eq!(normalize_tool_call_id("abc-123_def"), "abc-123_def");
+        assert_eq!(normalize_tool_call_id("a@b#c"), "a_b_c");
+        // Truncation at 64 chars
+        let long = "a".repeat(100);
+        assert_eq!(normalize_tool_call_id(&long).len(), 64);
     }
 
     #[test]
