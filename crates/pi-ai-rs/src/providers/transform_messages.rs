@@ -57,7 +57,7 @@ pub fn transform_messages(
                         AssistantContent::Thinking(t) => {
                             // Redacted thinking is opaque encrypted content, only valid
                             // for the same model.
-                            if t.redacted == Some(true) {
+                            if t.redacted.is_some_and(|v| v) {
                                 if is_same_model {
                                     return vec![block.clone()];
                                 }
