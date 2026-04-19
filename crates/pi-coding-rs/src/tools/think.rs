@@ -1,5 +1,6 @@
 use pi_agent_rs::types::{AgentTool, AgentToolResult, BoxFuture};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 /// A "thinking" tool that lets the agent reason step-by-step.
 pub struct ThinkTool;
@@ -10,7 +11,7 @@ impl AgentTool for ThinkTool {
     }
 
     fn label(&self) -> &str {
-        "Think"
+        "think"
     }
 
     fn description(&self) -> &str {
@@ -34,6 +35,7 @@ impl AgentTool for ThinkTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
+        _cancel: CancellationToken,
         _on_update: Option<pi_agent_rs::types::AgentToolUpdateCallback>,
     ) -> BoxFuture<'_, Result<AgentToolResult, anyhow::Error>> {
         Box::pin(async move {

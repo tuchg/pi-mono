@@ -26,4 +26,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+tokio-util = { workspace = true }
 glob = "0.3.3"

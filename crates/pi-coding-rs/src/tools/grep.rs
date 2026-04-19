@@ -1,8 +1,11 @@
 use pi_agent_rs::types::{AgentTool, AgentToolResult, BoxFuture};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
-/// Search file contents using regex patterns via `grep -rn`.
-pub struct GrepTool;
+/// Search file contents for a pattern using grep (equivalent to TS `grep` tool using ripgrep).
+pub struct GrepTool {
+    pub cwd: String,
+}
 
 impl AgentTool for GrepTool {
     fn name(&self) -> &str {
@@ -10,11 +13,11 @@ impl AgentTool for GrepTool {
     }
 
     fn label(&self) -> &str {
-        "Grep"
+        "grep"
     }
 
     fn description(&self) -> &str {
-        "Search for a regex pattern in file contents."
+        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -23,15 +26,31 @@ impl AgentTool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex pattern to search for"
+                    "description": "Search pattern (regex or literal string)"
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in"
+                    "description": "Directory or file to search (default: current directory)"
                 },
-                "include": {
+                "glob": {
                     "type": "string",
-                    "description": "Glob pattern to filter files (e.g. '*.rs')"
+                    "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"
+                },
+                "ignoreCase": {
+                    "type": "boolean",
+                    "description": "Case-insensitive search (default: false)"
+                },
+                "literal": {
+                    "type": "boolean",
+                    "description": "Treat pattern as literal string instead of regex (default: false)"
+                },
+                "context": {
+                    "type": "number",
+                    "description": "Number of lines to show before and after each match (default: 0)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of matches to return (default: 100)"
                 }
             },
             "required": ["pattern"]
@@ -42,6 +61,7 @@ impl AgentTool for GrepTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
+        _cancel: CancellationToken,
         _on_update: Option<pi_agent_rs::types::AgentToolUpdateCallback>,
     ) -> BoxFuture<'_, Result<AgentToolResult, anyhow::Error>> {
         Box::pin(async move {
@@ -49,31 +69,50 @@ impl AgentTool for GrepTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing 'pattern' parameter"))?;
             let path = params["path"].as_str().unwrap_or(".");
-            let include = params["include"].as_str();
+            let glob_filter = params["glob"].as_str();
+            let ignore_case = params["ignoreCase"].as_bool().unwrap_or(false);
+            let literal = params["literal"].as_bool().unwrap_or(false);
+            let context_lines = params["context"].as_u64().unwrap_or(0);
+            let _limit = params["limit"].as_u64().unwrap_or(100);
+
+            let search_path = if std::path::Path::new(path).is_absolute() {
+                path.to_string()
+            } else {
+                format!("{}/{path}", self.cwd)
+            };
 
             let mut cmd = tokio::process::Command::new("grep");
             cmd.arg("-rn").arg("--color=never");
 
-            if let Some(glob) = include {
+            if ignore_case {
+                cmd.arg("-i");
+            }
+            if literal {
+                cmd.arg("-F");
+            }
+            if context_lines > 0 {
+                cmd.arg(format!("-C{context_lines}"));
+            }
+            if let Some(glob) = glob_filter {
                 cmd.arg("--include").arg(glob);
             }
 
-            cmd.arg("--").arg(pattern).arg(path);
+            cmd.arg("--").arg(pattern).arg(&search_path);
 
             let output = cmd.output().await?;
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-            // grep exits 1 when no matches found — not an error
+            // grep exits 1 when no matches found -- not an error
             let exit_code = output.status.code().unwrap_or(-1);
             if exit_code > 1 || (exit_code != 0 && !stderr.is_empty()) {
                 return Err(anyhow::anyhow!("grep failed (exit {exit_code}): {stderr}"));
             }
 
             let text = if stdout.is_empty() {
-                "No matches found.".to_string()
+                "No matches found".to_string()
             } else {
-                stdout
+                stdout.trim_end().to_string()
             };
 
             Ok(AgentToolResult {

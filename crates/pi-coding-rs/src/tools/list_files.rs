@@ -1,20 +1,23 @@
 use pi_agent_rs::types::{AgentTool, AgentToolResult, BoxFuture};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
-/// List files and directories at a given path.
-pub struct ListFilesTool;
+/// List directory contents (equivalent to TS `ls` tool).
+pub struct LsTool {
+    pub cwd: String,
+}
 
-impl AgentTool for ListFilesTool {
+impl AgentTool for LsTool {
     fn name(&self) -> &str {
-        "list_files"
+        "ls"
     }
 
     fn label(&self) -> &str {
-        "List Files"
+        "ls"
     }
 
     fn description(&self) -> &str {
-        "List files and directories at the given path (up to 2 levels deep)."
+        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -23,10 +26,14 @@ impl AgentTool for ListFilesTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path to list"
+                    "description": "Directory to list (default: current directory)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of entries to return (default: 500)"
                 }
             },
-            "required": ["path"]
+            "required": []
         })
     }
 
@@ -34,22 +41,36 @@ impl AgentTool for ListFilesTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
+        _cancel: CancellationToken,
         _on_update: Option<pi_agent_rs::types::AgentToolUpdateCallback>,
     ) -> BoxFuture<'_, Result<AgentToolResult, anyhow::Error>> {
         Box::pin(async move {
-            let path = params["path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing 'path' parameter"))?;
+            let path_str = params["path"].as_str().unwrap_or(".");
+            let limit = params["limit"].as_u64().unwrap_or(500) as usize;
+
+            let dir_path = if std::path::Path::new(path_str).is_absolute() {
+                path_str.to_string()
+            } else {
+                format!("{}/{path_str}", self.cwd)
+            };
+
+            if !tokio::fs::try_exists(&dir_path).await.unwrap_or(false) {
+                return Err(anyhow::anyhow!("Path not found: {dir_path}"));
+            }
+
+            let metadata = tokio::fs::metadata(&dir_path).await?;
+            if !metadata.is_dir() {
+                return Err(anyhow::anyhow!("Not a directory: {dir_path}"));
+            }
 
             let mut entries = Vec::new();
-            let mut dir = tokio::fs::read_dir(path).await?;
+            let mut dir = tokio::fs::read_dir(&dir_path).await?;
 
             while let Some(entry) = dir.next_entry().await? {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Skip hidden files
-                if name.starts_with('.') {
-                    continue;
+                if entries.len() >= limit {
+                    break;
                 }
+                let name = entry.file_name().to_string_lossy().to_string();
                 let file_type = entry.file_type().await?;
                 if file_type.is_dir() {
                     entries.push(format!("{name}/"));
@@ -58,11 +79,18 @@ impl AgentTool for ListFilesTool {
                 }
             }
 
-            entries.sort();
+            // Sort case-insensitively to match TS behavior
+            entries.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+
+            let text = if entries.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                entries.join("\n")
+            };
 
             Ok(AgentToolResult {
                 content: vec![pi_ai_rs::Content::Text(pi_ai_rs::TextContent {
-                    text: entries.join("\n"),
+                    text,
                     text_signature: None,
                 })],
                 details: json!(null),
