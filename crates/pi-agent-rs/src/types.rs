@@ -209,6 +209,7 @@ pub trait AgentTool: Send + Sync {
         &self,
         tool_call_id: &str,
         params: serde_json::Value,
+        cancel: CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> BoxFuture<'_, Result<AgentToolResult, anyhow::Error>>;
 

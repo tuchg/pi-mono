@@ -36,7 +36,7 @@ pub fn agent_loop(
 
     tokio::spawn(async move {
         let messages = run_agent_loop(prompts, context, config, &mut sender, cancel).await;
-        sender.end(messages);
+        sender.end(Some(messages));
     });
 
     receiver
@@ -53,14 +53,14 @@ pub fn agent_loop_continue(
 ) -> AgentEventStream {
     if context.messages.is_empty() {
         let (mut sender, receiver) = create_agent_stream();
-        sender.end(Vec::new());
+        sender.end(Some(Vec::new()));
         tracing::error!("agent_loop_continue: context has no messages");
         return receiver;
     }
 
     if context.messages.last().map(|m| m.role()) == Some("assistant") {
         let (mut sender, receiver) = create_agent_stream();
-        sender.end(Vec::new());
+        sender.end(Some(Vec::new()));
         tracing::error!("agent_loop_continue: last message role is 'assistant'");
         return receiver;
     }
@@ -69,7 +69,7 @@ pub fn agent_loop_continue(
 
     tokio::spawn(async move {
         let messages = run_agent_loop_continue(context, config, &mut sender, cancel).await;
-        sender.end(messages);
+        sender.end(Some(messages));
     });
 
     receiver
@@ -495,7 +495,7 @@ async fn execute_tool_calls_parallel(
     // back through the sender (which requires &mut). We collect them post-hoc.
     let deferred_futures: Vec<_> = deferred
         .iter()
-        .map(|(_, tc, prepared)| execute_prepared(tc, prepared))
+        .map(|(_, tc, prepared)| execute_prepared(tc, prepared, cancel))
         .collect();
 
     let deferred_outcomes: Vec<ToolOutcome> = futures::future::join_all(deferred_futures).await;
@@ -561,7 +561,7 @@ async fn prepare_and_execute(
         PrepareResult::Immediate(outcome) => outcome,
         PrepareResult::Prepared(prepared) => {
             let validated_args = prepared.args.clone();
-            let outcome = execute_prepared_with_updates(tc, &prepared, sender).await;
+            let outcome = execute_prepared_with_updates(tc, &prepared, sender, cancel).await;
             apply_after_hook(context, assistant, tc, Some(validated_args), outcome, config, cancel).await
         }
     }
@@ -636,10 +636,11 @@ async fn prepare_tool_call(
 async fn execute_prepared(
     tc: &pi_ai_rs::ToolCall,
     prepared: &PreparedToolCall,
+    cancel: &CancellationToken,
 ) -> ToolOutcome {
     match prepared
         .tool
-        .execute(&tc.id, prepared.args.clone(), None)
+        .execute(&tc.id, prepared.args.clone(), cancel.clone(), None)
         .await
     {
         Ok(result) => ToolOutcome {
@@ -661,6 +662,7 @@ async fn execute_prepared_with_updates(
     tc: &pi_ai_rs::ToolCall,
     prepared: &PreparedToolCall,
     sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> ToolOutcome {
     let tool_call_id = tc.id.clone();
     let tool_name = tc.name.clone();
@@ -684,7 +686,7 @@ async fn execute_prepared_with_updates(
 
     let result = prepared
         .tool
-        .execute(&tc.id, prepared.args.clone(), Some(on_update))
+        .execute(&tc.id, prepared.args.clone(), cancel.clone(), Some(on_update))
         .await;
 
     // Emit collected update events.
@@ -777,7 +779,7 @@ async fn emit_tool_outcome(
         content: outcome.result.content,
         details: Some(outcome.result.details),
         is_error: outcome.is_error,
-        timestamp: 0,
+        timestamp: chrono::Utc::now().timestamp_millis() as u64,
     };
 
     let agent_result = AgentMessage::Standard(Message::ToolResult(result_msg.clone()));
@@ -799,6 +801,6 @@ fn error_result(message: &str) -> AgentToolResult {
             text: message.to_string(),
             text_signature: None,
         })],
-        details: serde_json::Value::Null,
+        details: serde_json::json!({}),
     }
 }
