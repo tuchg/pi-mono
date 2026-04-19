@@ -89,16 +89,11 @@ impl Default for MistralToolCallIdNormalizer {
 /// Map Mistral finish reason to our StopReason.
 pub fn map_mistral_stop_reason(reason: &str) -> StopReason {
     match reason {
-        "stop" | "end_turn" | "length" => {
-            if reason == "length" {
-                StopReason::Length
-            } else {
-                StopReason::Stop
-            }
-        }
-        "tool_calls" | "tool_use" => StopReason::ToolUse,
-        "model_length" => StopReason::Length,
-        _ => StopReason::Error,
+        "stop" => StopReason::Stop,
+        "length" | "model_length" => StopReason::Length,
+        "tool_calls" => StopReason::ToolUse,
+        "error" => StopReason::Error,
+        _ => StopReason::Stop,
     }
 }
 
@@ -123,21 +118,25 @@ impl std::fmt::Display for MistralReasoningEffort {
 }
 
 /// Map ThinkingLevel to Mistral reasoning effort.
-pub fn map_reasoning_effort(level: Option<ThinkingLevel>) -> MistralReasoningEffort {
-    match level {
-        Some(ThinkingLevel::High) | Some(ThinkingLevel::Xhigh) => MistralReasoningEffort::High,
-        _ => MistralReasoningEffort::None,
-    }
+///
+/// Mistral's `mapReasoningEffort` always returns `"high"` regardless of the
+/// requested level — the only question the caller answers is *whether* to
+/// enable reasoning at all.
+pub fn map_reasoning_effort(_level: Option<ThinkingLevel>) -> MistralReasoningEffort {
+    MistralReasoningEffort::High
 }
 
-/// Check if model uses prompt mode reasoning (older Mistral models).
+/// Check if model uses prompt mode reasoning.
+///
+/// Models that support reasoning but do NOT use the `reasoningEffort` parameter
+/// use `promptMode: "reasoning"` instead.
 pub fn uses_prompt_mode_reasoning(model: &Model) -> bool {
-    model.id.contains("mistral-large")
+    model.reasoning && !uses_reasoning_effort(model)
 }
 
 /// Check if model uses reasoning effort parameter.
 pub fn uses_reasoning_effort(model: &Model) -> bool {
-    model.id.contains("mistral-medium") || model.id.contains("magistral")
+    model.id == "mistral-small-2603" || model.id == "mistral-small-latest"
 }
 
 // =============================================================================
@@ -180,35 +179,26 @@ pub fn convert_mistral_messages(
                         }));
                     }
                     crate::types::UserContent::Parts(parts) => {
-                        if supports_image {
-                            let content: Vec<serde_json::Value> = parts
-                                .iter()
-                                .map(|p| match p {
-                                    crate::types::UserContentPart::Text(t) => {
-                                        serde_json::json!({"type": "text", "text": sanitize_surrogates(&t.text)})
-                                    }
-                                    crate::types::UserContentPart::Image(img) => {
-                                        serde_json::json!({
-                                            "type": "image_url",
-                                            "image_url": {"url": format!("data:{};base64,{}", img.mime_type, img.data)},
-                                        })
-                                    }
-                                })
-                                .collect();
+                        let had_images = parts.iter().any(|p| matches!(p, crate::types::UserContentPart::Image(_)));
+                        let content: Vec<serde_json::Value> = parts
+                            .iter()
+                            .filter(|p| matches!(p, crate::types::UserContentPart::Text(_)) || supports_image)
+                            .map(|p| match p {
+                                crate::types::UserContentPart::Text(t) => {
+                                    serde_json::json!({"type": "text", "text": sanitize_surrogates(&t.text)})
+                                }
+                                crate::types::UserContentPart::Image(img) => {
+                                    serde_json::json!({
+                                        "type": "image_url",
+                                        "imageUrl": format!("data:{};base64,{}", img.mime_type, img.data),
+                                    })
+                                }
+                            })
+                            .collect();
+                        if !content.is_empty() {
                             messages.push(serde_json::json!({"role": "user", "content": content}));
-                        } else {
-                            let text: String = parts
-                                .iter()
-                                .filter_map(|p| {
-                                    if let crate::types::UserContentPart::Text(t) = p {
-                                        Some(t.text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            messages.push(serde_json::json!({"role": "user", "content": sanitize_surrogates(&text)}));
+                        } else if had_images && !supports_image {
+                            messages.push(serde_json::json!({"role": "user", "content": "(image omitted: model does not support images)"}));
                         }
                     }
                 }
@@ -220,15 +210,21 @@ pub fn convert_mistral_messages(
                 for block in &assistant_msg.content {
                     match block {
                         AssistantContent::Text(t) => {
+                            if t.text.trim().is_empty() {
+                                continue;
+                            }
                             content_parts.push(serde_json::json!({
                                 "type": "text",
                                 "text": sanitize_surrogates(&t.text),
                             }));
                         }
                         AssistantContent::Thinking(t) => {
+                            if t.thinking.trim().is_empty() {
+                                continue;
+                            }
                             content_parts.push(serde_json::json!({
-                                "type": "text",
-                                "text": sanitize_surrogates(&t.thinking),
+                                "type": "thinking",
+                                "thinking": [{"type": "text", "text": sanitize_surrogates(&t.thinking)}],
                             }));
                         }
                         AssistantContent::ToolCall(tc) => {
@@ -245,16 +241,14 @@ pub fn convert_mistral_messages(
                     }
                 }
 
-                // Build assistant message content
-                let content = if content_parts.len() == 1 && content_parts[0]["type"] == "text" {
-                    content_parts[0]["text"].clone()
-                } else if content_parts.is_empty() {
-                    serde_json::Value::String(String::new())
-                } else {
-                    serde_json::json!(content_parts)
-                };
+                if content_parts.is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
 
-                let mut msg = serde_json::json!({"role": "assistant", "content": content});
+                let mut msg = serde_json::json!({"role": "assistant"});
+                if !content_parts.is_empty() {
+                    msg["content"] = serde_json::json!(content_parts);
+                }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = serde_json::json!(tool_calls);
                 }
@@ -274,24 +268,72 @@ pub fn convert_mistral_messages(
                     .collect::<Vec<_>>()
                     .join("\n");
 
+                let has_images = tr.content.iter().any(|c| matches!(c, Content::Image(_)));
                 let normalized_id = normalizer.normalize(&tr.tool_call_id);
-                let content = if text_result.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    sanitize_surrogates(&text_result)
-                };
+                let tool_text = build_tool_result_text(&text_result, has_images, supports_image, tr.is_error);
+
+                let mut tool_content: Vec<serde_json::Value> = vec![
+                    serde_json::json!({"type": "text", "text": tool_text}),
+                ];
+
+                if supports_image {
+                    for part in &tr.content {
+                        if let Content::Image(img) = part {
+                            tool_content.push(serde_json::json!({
+                                "type": "image_url",
+                                "imageUrl": format!("data:{};base64,{}", img.mime_type, img.data),
+                            }));
+                        }
+                    }
+                }
 
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": normalized_id,
                     "name": tr.tool_name,
-                    "content": content,
+                    "content": tool_content,
                 }));
             }
         }
     }
 
     messages
+}
+
+/// Build tool result text matching TS `buildToolResultText`.
+fn build_tool_result_text(text: &str, has_images: bool, supports_images: bool, is_error: bool) -> String {
+    let trimmed = text.trim();
+    let error_prefix = if is_error { "[tool error] " } else { "" };
+
+    if !trimmed.is_empty() {
+        let image_suffix = if has_images && !supports_images {
+            "\n[tool image omitted: model does not support images]"
+        } else {
+            ""
+        };
+        return format!("{}{}{}", error_prefix, trimmed, image_suffix);
+    }
+
+    if has_images {
+        if supports_images {
+            return if is_error {
+                "[tool error] (see attached image)".to_string()
+            } else {
+                "(see attached image)".to_string()
+            };
+        }
+        return if is_error {
+            "[tool error] (image omitted: model does not support images)".to_string()
+        } else {
+            "(image omitted: model does not support images)".to_string()
+        };
+    }
+
+    if is_error {
+        "[tool error] (no tool output)".to_string()
+    } else {
+        "(no tool output)".to_string()
+    }
 }
 
 /// Convert tools to Mistral function tool format.
