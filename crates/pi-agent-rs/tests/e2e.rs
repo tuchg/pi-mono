@@ -243,6 +243,7 @@ impl pi_agent_rs::AgentTool for EchoTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
         _on_update: Option<pi_agent_rs::AgentToolUpdateCallback>,
     ) -> pi_agent_rs::BoxFuture<'_, Result<pi_agent_rs::AgentToolResult, anyhow::Error>> {
         Box::pin(async move {
