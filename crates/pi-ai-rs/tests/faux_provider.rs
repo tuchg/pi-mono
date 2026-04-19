@@ -31,7 +31,7 @@ async fn faux_provider_text_response() {
     assert!(matches!(events.first().unwrap(), AssistantMessageEvent::Start { .. }));
     assert!(matches!(events.last().unwrap(), AssistantMessageEvent::Done { .. }));
 
-    // Verify text delta
+    // Verify all text deltas together form the original text
     let deltas: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
@@ -39,7 +39,8 @@ async fn faux_provider_text_response() {
             _ => None,
         })
         .collect();
-    assert_eq!(deltas, vec!["Hello world"]);
+    let joined: String = deltas.into_iter().collect();
+    assert_eq!(joined, "Hello world");
 
     reg.unregister();
 }
@@ -119,7 +120,7 @@ async fn faux_provider_thinking_content() {
     let mut stream = pi_ai_rs::stream_simple(model, ctx, Default::default()).unwrap();
 
     let mut has_thinking_start = false;
-    let mut has_thinking_delta = false;
+    let mut thinking_deltas = Vec::new();
     let mut has_thinking_end = false;
     let mut has_text_start = false;
 
@@ -127,8 +128,7 @@ async fn faux_provider_thinking_content() {
         match &event {
             AssistantMessageEvent::ThinkingStart { .. } => has_thinking_start = true,
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                assert_eq!(delta, "step by step");
-                has_thinking_delta = true;
+                thinking_deltas.push(delta.clone());
             }
             AssistantMessageEvent::ThinkingEnd { content, .. } => {
                 assert_eq!(content, "step by step");
@@ -140,7 +140,8 @@ async fn faux_provider_thinking_content() {
     }
 
     assert!(has_thinking_start);
-    assert!(has_thinking_delta);
+    assert!(!thinking_deltas.is_empty());
+    assert_eq!(thinking_deltas.join(""), "step by step");
     assert!(has_thinking_end);
     assert!(has_text_start);
 
