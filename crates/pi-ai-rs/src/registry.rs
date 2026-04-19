@@ -39,12 +39,47 @@ fn global_registry() -> &'static RwLock<HashMap<String, RegisteredProvider>> {
 
 /// Register an API provider. If `source_id` is provided it can be used to
 /// unregister all providers from that source later.
+///
+/// The provider's `stream` and `stream_simple` functions are wrapped with a
+/// runtime guard that panics when the model's `api` field does not match the
+/// provider's registered API (mirrors the TS `wrapStream` / `wrapStreamSimple`
+/// behaviour).
 pub fn register_api_provider(provider: ApiProvider, source_id: Option<&str>) {
+    let api = provider.api.clone();
+    let inner_stream = provider.stream;
+    let inner_simple = provider.stream_simple;
+
+    let api_for_stream = api.clone();
+    let wrapped_stream: StreamFn = Arc::new(move |model, ctx, opts| {
+        assert_eq!(
+            model.api, api_for_stream,
+            "Mismatched api: {} expected {}",
+            model.api, api_for_stream
+        );
+        inner_stream(model, ctx, opts)
+    });
+
+    let api_for_simple = api.clone();
+    let wrapped_simple: StreamSimpleFn = Arc::new(move |model, ctx, opts| {
+        assert_eq!(
+            model.api, api_for_simple,
+            "Mismatched api: {} expected {}",
+            model.api, api_for_simple
+        );
+        inner_simple(model, ctx, opts)
+    });
+
+    let wrapped_provider = ApiProvider {
+        api: api.clone(),
+        stream: wrapped_stream,
+        stream_simple: wrapped_simple,
+    };
+
     let mut registry = global_registry().write().expect("registry poisoned");
     registry.insert(
-        provider.api.clone(),
+        api,
         RegisteredProvider {
-            provider: Arc::new(provider),
+            provider: Arc::new(wrapped_provider),
             source_id: source_id.map(String::from),
         },
     );
