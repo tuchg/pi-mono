@@ -44,11 +44,15 @@ fn is_valid_thought_signature(signature: Option<&str>) -> bool {
     match signature {
         None => false,
         Some(sig) => {
-            if sig.len() % 4 != 0 {
+            if sig.is_empty() || sig.len() % 4 != 0 {
                 return false;
             }
-            sig.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+            // TS regex: /^[A-Za-z0-9+/]+={0,2}$/ — requires at least one non-padding char
+            let has_non_padding = sig.bytes().any(|b| b != b'=');
+            has_non_padding
+                && sig
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
         }
     }
 }
@@ -354,12 +358,16 @@ pub fn convert_google_messages(model: &Model, context: &Context) -> Vec<GeminiCo
                                 }
                             });
                             let include_id = requires_tool_call_id(&model.id);
+                            // TS: `args: block.arguments ?? {}` — default to empty object
+                            let args = if tool_call.arguments.is_null() {
+                                serde_json::Value::Object(Default::default())
+                            } else {
+                                tool_call.arguments.clone()
+                            };
                             parts.push(GeminiPart {
                                 function_call: Some(FunctionCallPart {
                                     name: tool_call.name.clone(),
-                                    args: Some(
-                                        tool_call.arguments.clone(),
-                                    ),
+                                    args: Some(args),
                                     id: if include_id {
                                         Some(tool_call.id.clone())
                                     } else {
@@ -612,6 +620,16 @@ mod tests {
     #[test]
     fn invalid_thought_signature_bad_length() {
         assert!(!is_valid_thought_signature(Some("abc")));
+    }
+
+    #[test]
+    fn invalid_thought_signature_empty() {
+        assert!(!is_valid_thought_signature(Some("")));
+    }
+
+    #[test]
+    fn invalid_thought_signature_all_padding() {
+        assert!(!is_valid_thought_signature(Some("====")));
     }
 
     #[test]
