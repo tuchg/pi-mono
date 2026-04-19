@@ -88,10 +88,35 @@ fn supports_xhigh() {
     let mut model = test_model("gpt-5.2-turbo", "openai");
     assert!(ModelRegistry::supports_xhigh(&model));
 
+    model.id = "gpt-5.3-codex".to_string();
+    assert!(ModelRegistry::supports_xhigh(&model));
+
+    model.id = "gpt-5.4".to_string();
+    assert!(ModelRegistry::supports_xhigh(&model));
+
     model.id = "claude-opus-4.6-preview".to_string();
     assert!(ModelRegistry::supports_xhigh(&model));
 
+    model.id = "claude-opus-4-6-20250414".to_string();
+    assert!(ModelRegistry::supports_xhigh(&model));
+
+    model.id = "claude-opus-4-7".to_string();
+    assert!(ModelRegistry::supports_xhigh(&model));
+
+    model.id = "claude-opus-4.7-20250601".to_string();
+    assert!(ModelRegistry::supports_xhigh(&model));
+
+    // Non-xhigh models
     model.id = "gpt-4o".to_string();
+    assert!(!ModelRegistry::supports_xhigh(&model));
+
+    model.id = "gpt-5.1-codex".to_string();
+    assert!(!ModelRegistry::supports_xhigh(&model));
+
+    model.id = "claude-sonnet-4.6".to_string();
+    assert!(!ModelRegistry::supports_xhigh(&model));
+
+    model.id = "claude-sonnet-4-20250514".to_string();
     assert!(!ModelRegistry::supports_xhigh(&model));
 }
 
@@ -105,4 +130,74 @@ fn models_are_equal() {
     assert!(!ModelRegistry::models_are_equal(Some(&a), Some(&c)));
     assert!(!ModelRegistry::models_are_equal(Some(&a), None));
     assert!(!ModelRegistry::models_are_equal(None, None));
+}
+
+#[test]
+fn calculate_cost_with_cache() {
+    let mut model = test_model("m1", "p");
+    model.cost.cache_read = 1.5;
+    model.cost.cache_write = 6.0;
+
+    let usage = Usage {
+        input: 500_000,
+        output: 500_000,
+        cache_read: 1_000_000,
+        cache_write: 200_000,
+        total_tokens: 2_200_000,
+        cost: Default::default(),
+    };
+
+    let cost = ModelRegistry::calculate_cost(&model, &usage);
+    // input: 3.0/M * 500K = 1.5
+    assert!((cost.input - 1.5).abs() < 1e-6);
+    // output: 15.0/M * 500K = 7.5
+    assert!((cost.output - 7.5).abs() < 1e-6);
+    // cache_read: 1.5/M * 1M = 1.5
+    assert!((cost.cache_read - 1.5).abs() < 1e-6);
+    // cache_write: 6.0/M * 200K = 1.2
+    assert!((cost.cache_write - 1.2).abs() < 1e-6);
+    assert!((cost.total - 11.7).abs() < 1e-6);
+}
+
+#[test]
+fn calculate_cost_zero_usage() {
+    let model = test_model("m1", "p");
+    let usage = Usage {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_write: 0,
+        total_tokens: 0,
+        cost: Default::default(),
+    };
+    let cost = ModelRegistry::calculate_cost(&model, &usage);
+    assert!((cost.total - 0.0).abs() < 1e-10);
+}
+
+#[test]
+fn register_overwrites_same_model() {
+    let mut registry = ModelRegistry::new();
+    let m1 = test_model("m1", "p");
+    let mut m1_v2 = test_model("m1", "p");
+    m1_v2.name = "updated".to_string();
+
+    registry.register(m1);
+    registry.register(m1_v2);
+
+    let models = registry.get_models("p");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].name, "updated");
+}
+
+#[test]
+fn get_models_empty_provider() {
+    let registry = ModelRegistry::new();
+    let models = registry.get_models("nonexistent");
+    assert!(models.is_empty());
+}
+
+#[test]
+fn default_creates_empty_registry() {
+    let registry = ModelRegistry::default();
+    assert!(registry.get_providers().is_empty());
 }

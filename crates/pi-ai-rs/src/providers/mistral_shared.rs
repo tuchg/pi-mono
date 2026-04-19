@@ -393,5 +393,89 @@ mod tests {
         assert_eq!(map_mistral_stop_reason("length"), StopReason::Length);
         assert_eq!(map_mistral_stop_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_mistral_stop_reason("model_length"), StopReason::Length);
+        assert_eq!(map_mistral_stop_reason("error"), StopReason::Error);
+        // Unknown maps to Stop
+        assert_eq!(map_mistral_stop_reason("unknown"), StopReason::Stop);
+    }
+
+    #[test]
+    fn derive_tool_call_id_collision_avoidance() {
+        // Different attempt numbers produce different results
+        let a = derive_mistral_tool_call_id("same-input", 0);
+        let b = derive_mistral_tool_call_id("same-input", 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_tool_call_id_alphanumeric_output() {
+        let result = derive_mistral_tool_call_id("a!b@c#d$e%f^g", 0);
+        assert!(result.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn normalizer_produces_correct_length() {
+        let mut norm = MistralToolCallIdNormalizer::new();
+        let result = norm.normalize("long-tool-call-id-that-is-more-than-nine-chars");
+        assert_eq!(result.len(), MISTRAL_TOOL_CALL_ID_LENGTH);
+    }
+
+    #[test]
+    fn reasoning_effort_always_high() {
+        assert_eq!(map_reasoning_effort(None), MistralReasoningEffort::High);
+        assert_eq!(
+            map_reasoning_effort(Some(ThinkingLevel::Low)),
+            MistralReasoningEffort::High
+        );
+        assert_eq!(
+            map_reasoning_effort(Some(ThinkingLevel::Medium)),
+            MistralReasoningEffort::High
+        );
+        assert_eq!(
+            map_reasoning_effort(Some(ThinkingLevel::High)),
+            MistralReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_display() {
+        assert_eq!(MistralReasoningEffort::None.to_string(), "none");
+        assert_eq!(MistralReasoningEffort::High.to_string(), "high");
+    }
+
+    #[test]
+    fn uses_reasoning_effort_for_small_models() {
+        let mut model = Model::default();
+        model.id = "mistral-small-2603".to_string();
+        assert!(uses_reasoning_effort(&model));
+
+        model.id = "mistral-small-latest".to_string();
+        assert!(uses_reasoning_effort(&model));
+
+        model.id = "mistral-large-2502".to_string();
+        assert!(!uses_reasoning_effort(&model));
+    }
+
+    #[test]
+    fn prompt_mode_reasoning_for_reasoning_model() {
+        let mut model = Model::default();
+        model.reasoning = true;
+        model.id = "mistral-large-2502".to_string();
+        assert!(uses_prompt_mode_reasoning(&model));
+    }
+
+    #[test]
+    fn prompt_mode_reasoning_false_for_effort_model() {
+        let mut model = Model::default();
+        model.reasoning = true;
+        model.id = "mistral-small-2603".to_string();
+        assert!(!uses_prompt_mode_reasoning(&model));
+    }
+
+    #[test]
+    fn prompt_mode_reasoning_false_for_non_reasoning_model() {
+        let mut model = Model::default();
+        model.reasoning = false;
+        model.id = "mistral-large-2502".to_string();
+        assert!(!uses_prompt_mode_reasoning(&model));
     }
 }

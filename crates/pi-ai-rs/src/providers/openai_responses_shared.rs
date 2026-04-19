@@ -611,4 +611,164 @@ mod tests {
     fn service_tier_default() {
         assert_eq!(get_service_tier_cost_multiplier(None), 1.0);
     }
+
+    #[test]
+    fn build_foreign_id_short() {
+        let result = build_foreign_responses_item_id("item_abc");
+        assert!(result.starts_with("fc_"));
+        assert!(result.len() <= 64);
+    }
+
+    #[test]
+    fn build_foreign_id_deterministic() {
+        let a = build_foreign_responses_item_id("same_id");
+        let b = build_foreign_responses_item_id("same_id");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn build_foreign_id_different_for_different_inputs() {
+        let a = build_foreign_responses_item_id("id_1");
+        let b = build_foreign_responses_item_id("id_2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn normalize_id_part_trailing_underscore_stripped() {
+        assert_eq!(normalize_id_part("hello___"), "hello");
+    }
+
+    #[test]
+    fn normalize_id_part_empty_input() {
+        assert_eq!(normalize_id_part(""), "");
+    }
+
+    #[test]
+    fn map_stop_reason_cancelled() {
+        assert_eq!(map_openai_stop_reason(Some("cancelled")), StopReason::Error);
+    }
+
+    #[test]
+    fn map_stop_reason_in_progress() {
+        assert_eq!(
+            map_openai_stop_reason(Some("in_progress")),
+            StopReason::Stop
+        );
+    }
+
+    #[test]
+    fn map_stop_reason_queued() {
+        assert_eq!(map_openai_stop_reason(Some("queued")), StopReason::Stop);
+    }
+
+    #[test]
+    fn map_stop_reason_none_default() {
+        assert_eq!(map_openai_stop_reason(None), StopReason::Stop);
+    }
+
+    #[test]
+    fn map_stop_reason_unknown() {
+        assert_eq!(
+            map_openai_stop_reason(Some("weird_status")),
+            StopReason::Error
+        );
+    }
+
+    #[test]
+    fn apply_service_tier_flex_pricing() {
+        let mut usage = Usage {
+            cost: crate::types::UsageCost {
+                input: 10.0,
+                output: 20.0,
+                cache_read: 5.0,
+                cache_write: 3.0,
+                total: 38.0,
+            },
+            ..Default::default()
+        };
+        apply_service_tier_pricing(&mut usage, Some("flex"));
+        assert!((usage.cost.input - 5.0).abs() < f64::EPSILON);
+        assert!((usage.cost.output - 10.0).abs() < f64::EPSILON);
+        assert!((usage.cost.total - 19.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn apply_service_tier_default_no_change() {
+        let mut usage = Usage {
+            cost: crate::types::UsageCost {
+                input: 10.0,
+                output: 20.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 30.0,
+            },
+            ..Default::default()
+        };
+        apply_service_tier_pricing(&mut usage, None);
+        assert!((usage.cost.input - 10.0).abs() < f64::EPSILON);
+        assert!((usage.cost.total - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_cache_retention_default_is_short() {
+        // Clean the env var to ensure deterministic behavior.
+        let _ = unsafe { std::env::remove_var("PI_CACHE_RETENTION") };
+        assert_eq!(
+            resolve_cache_retention(None),
+            crate::types::CacheRetention::Short
+        );
+    }
+
+    #[test]
+    fn resolve_cache_retention_explicit_overrides() {
+        assert_eq!(
+            resolve_cache_retention(Some(crate::types::CacheRetention::Long)),
+            crate::types::CacheRetention::Long
+        );
+        assert_eq!(
+            resolve_cache_retention(Some(crate::types::CacheRetention::None)),
+            crate::types::CacheRetention::None
+        );
+    }
+
+    #[test]
+    fn get_prompt_cache_retention_long_on_openai() {
+        assert_eq!(
+            get_prompt_cache_retention("https://api.openai.com/v1", crate::types::CacheRetention::Long),
+            Some("24h")
+        );
+    }
+
+    #[test]
+    fn get_prompt_cache_retention_short_returns_none() {
+        assert_eq!(
+            get_prompt_cache_retention("https://api.openai.com/v1", crate::types::CacheRetention::Short),
+            None
+        );
+    }
+
+    #[test]
+    fn get_prompt_cache_retention_long_non_openai_returns_none() {
+        assert_eq!(
+            get_prompt_cache_retention("https://api.other.com/v1", crate::types::CacheRetention::Long),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_text_signature_v1_unknown_phase() {
+        // Unknown phase values should parse with phase = None (not error).
+        let json = r#"{"v":1,"id":"msg_789","phase":"unknown_phase"}"#;
+        let result = parse_text_signature(Some(json)).unwrap();
+        assert_eq!(result.id, "msg_789");
+        assert!(result.phase.is_none());
+    }
+
+    #[test]
+    fn encode_then_parse_roundtrip() {
+        let encoded = encode_text_signature_v1("msg_rt", Some(TextSignaturePhase::Commentary));
+        let parsed = parse_text_signature(Some(&encoded)).unwrap();
+        assert_eq!(parsed.id, "msg_rt");
+        assert_eq!(parsed.phase, Some(TextSignaturePhase::Commentary));
+    }
 }

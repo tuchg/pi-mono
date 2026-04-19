@@ -497,6 +497,7 @@ pub fn convert_anthropic_tools(tools: &[Tool], is_oauth: bool) -> Vec<serde_json
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CacheRetention;
 
     #[test]
     fn claude_code_name_mapping() {
@@ -550,6 +551,18 @@ mod tests {
             AnthropicEffort::Low
         );
         assert_eq!(
+            map_thinking_level_to_effort(Some(ThinkingLevel::Minimal), "claude-opus-4.6"),
+            AnthropicEffort::Low
+        );
+        assert_eq!(
+            map_thinking_level_to_effort(Some(ThinkingLevel::Medium), "claude-opus-4.6"),
+            AnthropicEffort::Medium
+        );
+        assert_eq!(
+            map_thinking_level_to_effort(Some(ThinkingLevel::High), "claude-opus-4.6"),
+            AnthropicEffort::High
+        );
+        assert_eq!(
             map_thinking_level_to_effort(Some(ThinkingLevel::Xhigh), "claude-opus-4.6-20250414"),
             AnthropicEffort::Max
         );
@@ -557,6 +570,107 @@ mod tests {
             map_thinking_level_to_effort(Some(ThinkingLevel::Xhigh), "claude-opus-4.7"),
             AnthropicEffort::Xhigh
         );
+        // Xhigh on non-opus falls to High
+        assert_eq!(
+            map_thinking_level_to_effort(Some(ThinkingLevel::Xhigh), "claude-sonnet-4"),
+            AnthropicEffort::High
+        );
+        assert_eq!(
+            map_thinking_level_to_effort(Some(ThinkingLevel::Xhigh), "claude-sonnet-4.6"),
+            AnthropicEffort::High
+        );
+        // None defaults to High
+        assert_eq!(
+            map_thinking_level_to_effort(None, "claude-opus-4.6"),
+            AnthropicEffort::High
+        );
+    }
+
+    #[test]
+    fn effort_display() {
+        assert_eq!(AnthropicEffort::Low.to_string(), "low");
+        assert_eq!(AnthropicEffort::Medium.to_string(), "medium");
+        assert_eq!(AnthropicEffort::High.to_string(), "high");
+        assert_eq!(AnthropicEffort::Xhigh.to_string(), "xhigh");
+        assert_eq!(AnthropicEffort::Max.to_string(), "max");
+    }
+
+    #[test]
+    fn adaptive_thinking_sonnet_4_6() {
+        assert!(supports_adaptive_thinking("claude-sonnet-4.6"));
+        assert!(supports_adaptive_thinking("claude-sonnet-4-6-20250414"));
+    }
+
+    #[test]
+    fn adaptive_thinking_non_supported() {
+        assert!(!supports_adaptive_thinking("claude-sonnet-4-20250514"));
+        assert!(!supports_adaptive_thinking("claude-3-5-sonnet"));
+        assert!(!supports_adaptive_thinking("claude-haiku-4.6"));
+    }
+
+    #[test]
+    fn cache_control_none_retention() {
+        let (retention, cc) = get_anthropic_cache_control(
+            "https://api.anthropic.com",
+            Some(CacheRetention::None),
+        );
+        assert_eq!(retention, CacheRetention::None);
+        assert!(cc.is_none());
+    }
+
+    #[test]
+    fn cache_control_short_on_anthropic_no_ttl() {
+        let (retention, cc) = get_anthropic_cache_control(
+            "https://api.anthropic.com/v1/messages",
+            Some(CacheRetention::Short),
+        );
+        assert_eq!(retention, CacheRetention::Short);
+        let cc = cc.unwrap();
+        assert_eq!(cc["type"], "ephemeral");
+        assert!(cc.get("ttl").is_none());
+    }
+
+    #[test]
+    fn cache_control_long_on_anthropic_has_ttl() {
+        let (retention, cc) = get_anthropic_cache_control(
+            "https://api.anthropic.com/v1/messages",
+            Some(CacheRetention::Long),
+        );
+        assert_eq!(retention, CacheRetention::Long);
+        let cc = cc.unwrap();
+        assert_eq!(cc["type"], "ephemeral");
+        assert_eq!(cc["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_control_long_on_non_anthropic_no_ttl() {
+        let (retention, cc) = get_anthropic_cache_control(
+            "https://bedrock.us-east-1.amazonaws.com",
+            Some(CacheRetention::Long),
+        );
+        assert_eq!(retention, CacheRetention::Long);
+        let cc = cc.unwrap();
+        assert_eq!(cc["type"], "ephemeral");
+        assert!(cc.get("ttl").is_none());
+    }
+
+    #[test]
+    fn normalize_tool_call_id_preserves_valid() {
+        assert_eq!(normalize_tool_call_id("abc-123_def"), "abc-123_def");
+        assert_eq!(normalize_tool_call_id("simple"), "simple");
+    }
+
+    #[test]
+    fn normalize_tool_call_id_replaces_special() {
+        assert_eq!(normalize_tool_call_id("a@b#c"), "a_b_c");
+        assert_eq!(normalize_tool_call_id("a b c"), "a_b_c");
+        assert_eq!(normalize_tool_call_id("a.b.c"), "a_b_c");
+    }
+
+    #[test]
+    fn normalize_tool_call_id_truncates() {
+        let long = "a".repeat(100);
+        assert_eq!(normalize_tool_call_id(&long).len(), 64);
     }
 
     #[test]

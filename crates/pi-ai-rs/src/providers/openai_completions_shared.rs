@@ -360,4 +360,112 @@ mod tests {
         })];
         assert!(!has_tool_history(&msgs));
     }
+
+    #[test]
+    fn has_tool_history_with_assistant_tool_call() {
+        let msgs = vec![crate::types::Message::Assistant(
+            crate::types::AssistantMessage {
+                content: vec![crate::types::AssistantContent::ToolCall(
+                    crate::types::ToolCall {
+                        id: "tc1".to_string(),
+                        name: "test".to_string(),
+                        arguments: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                )],
+                ..Default::default()
+            },
+        )];
+        assert!(has_tool_history(&msgs));
+    }
+
+    #[test]
+    fn has_tool_history_empty() {
+        assert!(!has_tool_history(&[]));
+    }
+
+    #[test]
+    fn convert_tools_format() {
+        let tools = vec![Tool {
+            name: "my_tool".to_string(),
+            description: "A test tool".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+        }];
+        let result = convert_completions_tools(&tools);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["type"], "function");
+        assert_eq!(result[0]["function"]["name"], "my_tool");
+        assert_eq!(result[0]["function"]["description"], "A test tool");
+        assert!(result[0]["function"]["parameters"]["properties"]["x"]["type"].is_string());
+    }
+
+    #[test]
+    fn convert_tools_empty() {
+        let result = convert_completions_tools(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_chunk_usage_basic() {
+        let model = Model {
+            cost: crate::types::ModelCost {
+                input: 3.0,
+                output: 15.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let usage_json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+        });
+        let usage = parse_chunk_usage(&usage_json, &model);
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn parse_chunk_usage_with_cache() {
+        let model = Model {
+            cost: crate::types::ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            ..Default::default()
+        };
+        let usage_json = serde_json::json!({
+            "prompt_tokens": 200,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {
+                "cached_tokens": 120,
+                "cache_write_tokens": 30
+            }
+        });
+        let usage = parse_chunk_usage(&usage_json, &model);
+        // cache_read = cached_tokens - cache_write = 120 - 30 = 90
+        assert_eq!(usage.cache_read, 90);
+        assert_eq!(usage.cache_write, 30);
+        // input = prompt_tokens - cache_read - cache_write = 200 - 90 - 30 = 80
+        assert_eq!(usage.input, 80);
+        assert_eq!(usage.output, 50);
+    }
+
+    #[test]
+    fn parse_chunk_usage_with_reasoning_tokens() {
+        let model = Model::default();
+        let usage_json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "completion_tokens_details": {
+                "reasoning_tokens": 30
+            }
+        });
+        let usage = parse_chunk_usage(&usage_json, &model);
+        // output = completion_tokens + reasoning_tokens = 50 + 30 = 80
+        assert_eq!(usage.output, 80);
+    }
 }

@@ -433,15 +433,21 @@ mod tests {
     #[test]
     fn thinking_budgets() {
         assert_eq!(default_thinking_budget(ThinkingLevel::Minimal), 1024);
+        assert_eq!(default_thinking_budget(ThinkingLevel::Low), 4096);
+        assert_eq!(default_thinking_budget(ThinkingLevel::Medium), 10240);
         assert_eq!(default_thinking_budget(ThinkingLevel::High), 32768);
+        assert_eq!(default_thinking_budget(ThinkingLevel::Xhigh), 65536);
     }
 
     #[test]
     fn mime_to_format() {
         assert_eq!(mime_to_bedrock_format("image/jpeg"), "jpeg");
+        assert_eq!(mime_to_bedrock_format("image/jpg"), "jpeg");
         assert_eq!(mime_to_bedrock_format("image/png"), "png");
         assert_eq!(mime_to_bedrock_format("image/gif"), "gif");
+        assert_eq!(mime_to_bedrock_format("image/webp"), "webp");
         assert_eq!(mime_to_bedrock_format("unknown"), "png");
+        assert_eq!(mime_to_bedrock_format(""), "png");
     }
 
     #[test]
@@ -451,8 +457,119 @@ mod tests {
             "Throttling error"
         );
         assert_eq!(
+            format_bedrock_error_prefix("InternalServerException"),
+            "Internal server error"
+        );
+        assert_eq!(
+            format_bedrock_error_prefix("ModelStreamErrorException"),
+            "Model stream error"
+        );
+        assert_eq!(
+            format_bedrock_error_prefix("ValidationException"),
+            "Validation error"
+        );
+        assert_eq!(
+            format_bedrock_error_prefix("ServiceUnavailableException"),
+            "Service unavailable"
+        );
+        assert_eq!(
             format_bedrock_error_prefix("CustomError"),
             "CustomError"
         );
+    }
+
+    fn bedrock_model(id: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: "amazon-bedrock".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn supports_thinking_signature_claude_models() {
+        assert!(supports_thinking_signature(&bedrock_model("anthropic.claude-3-5-sonnet")));
+        assert!(supports_thinking_signature(&bedrock_model("anthropic.claude-v2")));
+        assert!(supports_thinking_signature(&bedrock_model("anthropic/claude-3-5-haiku")));
+    }
+
+    #[test]
+    fn supports_thinking_signature_non_claude() {
+        assert!(!supports_thinking_signature(&bedrock_model("meta.llama3-70b")));
+        assert!(!supports_thinking_signature(&bedrock_model("amazon.titan-text")));
+        assert!(!supports_thinking_signature(&bedrock_model("cohere.command-r")));
+    }
+
+    #[test]
+    fn supports_prompt_caching_claude_4x() {
+        assert!(supports_prompt_caching(&bedrock_model("anthropic.claude-4-opus")));
+        assert!(supports_prompt_caching(&bedrock_model("claude-4.6-sonnet")));
+    }
+
+    #[test]
+    fn supports_prompt_caching_claude_3x() {
+        assert!(supports_prompt_caching(&bedrock_model("claude-3-7-sonnet-v1")));
+        assert!(supports_prompt_caching(&bedrock_model("claude-3-5-haiku-v2")));
+    }
+
+    #[test]
+    fn no_prompt_caching_older_claude() {
+        assert!(!supports_prompt_caching(&bedrock_model("claude-3-opus")));
+        assert!(!supports_prompt_caching(&bedrock_model("claude-3-haiku")));
+        assert!(!supports_prompt_caching(&bedrock_model("claude-2")));
+    }
+
+    #[test]
+    fn no_prompt_caching_non_claude() {
+        assert!(!supports_prompt_caching(&bedrock_model("meta.llama3-70b")));
+        assert!(!supports_prompt_caching(&bedrock_model("amazon.titan-text")));
+    }
+
+    #[test]
+    fn stop_reason_model_context_window_exceeded() {
+        assert_eq!(
+            map_bedrock_stop_reason(Some("model_context_window_exceeded")),
+            StopReason::Length
+        );
+    }
+
+    #[test]
+    fn stop_reason_stop_sequence() {
+        assert_eq!(
+            map_bedrock_stop_reason(Some("stop_sequence")),
+            StopReason::Stop
+        );
+    }
+
+    #[test]
+    fn stop_reason_none() {
+        assert_eq!(map_bedrock_stop_reason(None), StopReason::Error);
+    }
+
+    #[test]
+    fn stop_reason_unknown() {
+        assert_eq!(
+            map_bedrock_stop_reason(Some("unexpected")),
+            StopReason::Error
+        );
+    }
+
+    #[test]
+    fn cache_point_none_retention() {
+        assert!(build_cache_point(CacheRetention::None).is_none());
+    }
+
+    #[test]
+    fn cache_point_short_retention() {
+        let cp = build_cache_point(CacheRetention::Short).unwrap();
+        assert_eq!(cp["cachePoint"]["type"], "default");
+        assert!(cp["cachePoint"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn cache_point_long_retention() {
+        let cp = build_cache_point(CacheRetention::Long).unwrap();
+        assert_eq!(cp["cachePoint"]["type"], "default");
+        assert_eq!(cp["cachePoint"]["ttl"], "1h");
     }
 }

@@ -101,4 +101,77 @@ mod tests {
         let headers = build_copilot_dynamic_headers(&[], false);
         assert!(!headers.contains_key("Copilot-Vision-Request"));
     }
+
+    #[test]
+    fn copilot_headers_always_include_initiator() {
+        let headers = build_copilot_dynamic_headers(&[], false);
+        assert!(headers.contains_key("X-Initiator"));
+        assert_eq!(headers.get("X-Initiator").unwrap(), "user");
+    }
+
+    #[test]
+    fn copilot_headers_always_include_openai_intent() {
+        let headers = build_copilot_dynamic_headers(&[], false);
+        assert_eq!(
+            headers.get("Openai-Intent").unwrap(),
+            "conversation-edits"
+        );
+    }
+
+    #[test]
+    fn initiator_agent_when_tool_result_last() {
+        let msgs = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "tc".to_string(),
+            tool_name: "test".to_string(),
+            content: vec![],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })];
+        // ToolResult → not a user message → agent
+        assert_eq!(infer_copilot_initiator(&msgs), "agent");
+    }
+
+    #[test]
+    fn has_vision_with_image_in_user_parts() {
+        let msgs = vec![Message::User(UserMessage {
+            content: UserContent::Parts(vec![
+                crate::types::UserContentPart::Text(crate::types::TextContent {
+                    text: "hi".to_string(),
+                    text_signature: None,
+                }),
+                crate::types::UserContentPart::Image(crate::types::ImageContent {
+                    mime_type: "image/png".to_string(),
+                    data: "base64...".to_string(),
+                }),
+            ]),
+            timestamp: 0,
+        })];
+        assert!(has_copilot_vision_input(&msgs));
+    }
+
+    #[test]
+    fn no_vision_with_text_only_user() {
+        let msgs = vec![Message::User(UserMessage {
+            content: UserContent::Text("just text".to_string()),
+            timestamp: 0,
+        })];
+        assert!(!has_copilot_vision_input(&msgs));
+    }
+
+    #[test]
+    fn has_vision_in_tool_result() {
+        let msgs = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "tc".to_string(),
+            tool_name: "screenshot".to_string(),
+            content: vec![crate::types::Content::Image(crate::types::ImageContent {
+                mime_type: "image/png".to_string(),
+                data: "base64...".to_string(),
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })];
+        assert!(has_copilot_vision_input(&msgs));
+    }
 }

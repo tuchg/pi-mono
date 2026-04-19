@@ -665,4 +665,143 @@ mod tests {
         assert!(decls.is_array());
         assert_eq!(decls[0]["name"], "test");
     }
+
+    #[test]
+    fn convert_tools_uses_parameters_json_schema_for_gemini3() {
+        let tools = vec![crate::types::Tool {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+        }];
+        // use_parameters=false → parametersJsonSchema
+        let result = convert_google_tools(&tools, false).unwrap();
+        let decl = &result[0]["functionDeclarations"][0];
+        assert!(decl.get("parametersJsonSchema").is_some());
+        assert!(decl.get("parameters").is_none());
+    }
+
+    #[test]
+    fn convert_tools_uses_parameters_for_older_gemini() {
+        let tools = vec![crate::types::Tool {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        // use_parameters=true → parameters
+        let result = convert_google_tools(&tools, true).unwrap();
+        let decl = &result[0]["functionDeclarations"][0];
+        assert!(decl.get("parameters").is_some());
+        assert!(decl.get("parametersJsonSchema").is_none());
+    }
+
+    // retain_thought_signature edge cases
+
+    #[test]
+    fn retain_thought_signature_both_none() {
+        assert_eq!(retain_thought_signature(None, None), None);
+    }
+
+    #[test]
+    fn retain_thought_signature_existing_none_incoming_valid() {
+        assert_eq!(
+            retain_thought_signature(None, Some("new_sig")),
+            Some("new_sig")
+        );
+    }
+
+    #[test]
+    fn retain_thought_signature_existing_none_incoming_empty() {
+        assert_eq!(retain_thought_signature(None, Some("")), None);
+    }
+
+    // resolve_thought_signature tests
+
+    #[test]
+    fn resolve_signature_same_model_valid() {
+        let result = resolve_thought_signature(true, Some("YWJjZGVm"));
+        assert_eq!(result, Some("YWJjZGVm".to_string()));
+    }
+
+    #[test]
+    fn resolve_signature_same_model_invalid() {
+        let result = resolve_thought_signature(true, Some("abc"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_signature_cross_model_strips() {
+        let result = resolve_thought_signature(false, Some("YWJjZGVm"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_signature_same_model_none() {
+        let result = resolve_thought_signature(true, None);
+        assert!(result.is_none());
+    }
+
+    // is_thinking_part edge cases
+
+    #[test]
+    fn is_thinking_part_false_explicit() {
+        assert!(!is_thinking_part(Some(false), None));
+        assert!(!is_thinking_part(Some(false), Some("sig")));
+    }
+
+    #[test]
+    fn is_thinking_part_none_with_no_signature() {
+        assert!(!is_thinking_part(None, None));
+    }
+
+    // supports_multimodal_function_response
+
+    #[test]
+    fn multimodal_function_response_gemini_2() {
+        assert!(!supports_multimodal_function_response("gemini-2.0-flash"));
+    }
+
+    #[test]
+    fn multimodal_function_response_gemini_3() {
+        assert!(supports_multimodal_function_response("gemini-3-pro"));
+    }
+
+    #[test]
+    fn multimodal_function_response_non_gemini() {
+        // Non-Gemini models default to true.
+        assert!(supports_multimodal_function_response("claude-4-sonnet"));
+    }
+
+    // gemini_major_version additional
+
+    #[test]
+    fn gemini_major_version_live() {
+        assert_eq!(get_gemini_major_version("gemini-live-2-flash"), Some(2));
+    }
+
+    #[test]
+    fn gemini_major_version_no_number() {
+        assert_eq!(get_gemini_major_version("gemini-pro"), None);
+    }
+
+    // tool_choice fallback
+
+    #[test]
+    fn tool_choice_unknown_defaults_to_auto() {
+        assert_eq!(map_tool_choice("custom"), FunctionCallingMode::Auto);
+        assert_eq!(map_tool_choice(""), FunctionCallingMode::Auto);
+    }
+
+    // valid_thought_signature with padding
+
+    #[test]
+    fn valid_thought_signature_with_padding() {
+        assert!(is_valid_thought_signature(Some("YWJj")));
+        assert!(is_valid_thought_signature(Some("YQ==")));
+        assert!(is_valid_thought_signature(Some("YWI=")));
+    }
+
+    #[test]
+    fn invalid_thought_signature_none() {
+        assert!(!is_valid_thought_signature(None));
+    }
 }
