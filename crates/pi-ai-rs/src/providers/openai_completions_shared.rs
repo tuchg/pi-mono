@@ -66,7 +66,9 @@ pub fn convert_completions_messages(
         }));
     }
 
-    for msg in &transformed {
+    let mut i = 0;
+    while i < transformed.len() {
+        let msg = &transformed[i];
         match msg {
             crate::types::Message::User(user) => {
                 match &user.content {
@@ -146,59 +148,102 @@ pub fn convert_completions_messages(
 
                 // Skip assistant messages with no content and no tool calls.
                 let has_content = !content_text.is_empty();
-                if !has_content && tool_calls.is_empty() {
-                    continue;
-                }
+                if has_content || !tool_calls.is_empty() {
+                    let mut msg = serde_json::json!({"role": "assistant"});
+                    if has_content {
+                        msg["content"] = serde_json::Value::String(content_text);
+                    } else {
+                        msg["content"] = serde_json::Value::Null;
+                    }
+                    if !tool_calls.is_empty() {
+                        msg["tool_calls"] = serde_json::json!(tool_calls);
+                    }
 
-                let mut msg = serde_json::json!({"role": "assistant"});
-                if has_content {
-                    msg["content"] = serde_json::Value::String(content_text);
-                } else {
-                    msg["content"] = serde_json::Value::Null;
-                }
-                if !tool_calls.is_empty() {
-                    msg["tool_calls"] = serde_json::json!(tool_calls);
-                }
-
-                // Include thinking/reasoning via the signature field name
-                // (e.g., "reasoning_content", "reasoning") when available.
-                if !thinking_parts.is_empty() {
-                    if let Some(ref sig) = thinking_signature {
-                        if !sig.is_empty() {
-                            msg[sig] = serde_json::Value::String(thinking_parts.join("\n"));
+                    // Include thinking/reasoning via the signature field name
+                    // (e.g., "reasoning_content", "reasoning") when available.
+                    if !thinking_parts.is_empty() {
+                        if let Some(ref sig) = thinking_signature {
+                            if !sig.is_empty() {
+                                msg[sig] = serde_json::Value::String(thinking_parts.join("\n"));
+                            }
                         }
+                    }
+
+                    messages.push(msg);
+                }
+            }
+            crate::types::Message::ToolResult(_) => {
+                // Batch consecutive tool results and collect their images.
+                let mut image_parts: Vec<serde_json::Value> = Vec::new();
+                let mut j = i;
+
+                while j < transformed.len() {
+                    if let crate::types::Message::ToolResult(tr) = &transformed[j] {
+                        let text_result: String = tr
+                            .content
+                            .iter()
+                            .filter_map(|c| {
+                                if let Content::Text(t) = c {
+                                    Some(t.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        let has_images = tr.content.iter().any(|c| matches!(c, Content::Image(_)));
+                        let has_text = !text_result.is_empty();
+                        let content_str = if has_text {
+                            sanitize_surrogates(&text_result)
+                        } else if has_images {
+                            "(see attached image)".to_string()
+                        } else {
+                            "(no output)".to_string()
+                        };
+
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tr.tool_call_id,
+                            "content": content_str,
+                        }));
+
+                        if supports_image && has_images {
+                            for c in &tr.content {
+                                if let Content::Image(img) = c {
+                                    image_parts.push(serde_json::json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                                        },
+                                    }));
+                                }
+                            }
+                        }
+
+                        j += 1;
+                    } else {
+                        break;
                     }
                 }
 
-                messages.push(msg);
-            }
-            crate::types::Message::ToolResult(tr) => {
-                let text_result: String = tr
-                    .content
-                    .iter()
-                    .filter_map(|c| {
-                        if let Content::Text(t) = c {
-                            Some(t.text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                if !image_parts.is_empty() {
+                    let mut content: Vec<serde_json::Value> = vec![serde_json::json!({
+                        "type": "text",
+                        "text": "Attached image(s) from tool result:",
+                    })];
+                    content.extend(image_parts);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
 
-                let content = if text_result.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    sanitize_surrogates(&text_result)
-                };
-
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tr.tool_call_id,
-                    "content": content,
-                }));
+                i = j;
+                continue;
             }
         }
+        i += 1;
     }
 
     messages

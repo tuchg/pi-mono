@@ -120,6 +120,31 @@ fn supports_xhigh() {
     assert!(!ModelRegistry::supports_xhigh(&model));
 }
 
+/// Port of "returns true for OpenRouter Opus 4.6 (openai-completions API)"
+/// from `packages/ai/test/supports-xhigh.test.ts`.
+#[test]
+fn supports_xhigh_openrouter_opus() {
+    // OpenRouter model IDs use the `provider/model` format.
+    let mut model = test_model("anthropic/claude-opus-4.6", "openrouter");
+    model.api = "openai-completions".to_string();
+    assert!(
+        ModelRegistry::supports_xhigh(&model),
+        "OpenRouter Opus 4.6 (openai-completions API) should support xhigh"
+    );
+
+    model.id = "anthropic/claude-opus-4-7-20250601".to_string();
+    assert!(
+        ModelRegistry::supports_xhigh(&model),
+        "OpenRouter Opus 4.7 should support xhigh"
+    );
+
+    model.id = "anthropic/claude-sonnet-4.6".to_string();
+    assert!(
+        !ModelRegistry::supports_xhigh(&model),
+        "OpenRouter Sonnet 4.6 should not support xhigh"
+    );
+}
+
 #[test]
 fn models_are_equal() {
     let a = test_model("m1", "p1");
