@@ -45,12 +45,25 @@ pub fn parse_text_signature(signature: Option<&str>) -> Option<ParsedTextSignatu
     }
 
     if sig.starts_with('{') {
-        if let Ok(parsed) = serde_json::from_str::<TextSignatureV1>(sig) {
-            if parsed.v == 1 {
-                return Some(ParsedTextSignature {
-                    id: parsed.id,
-                    phase: parsed.phase,
-                });
+        // Use a permissive struct so that unknown phase values don't reject the
+        // entire payload — mirrors the TS code which parses with `Partial<>` and
+        // then validates the phase separately.
+        #[derive(Deserialize)]
+        struct Permissive {
+            v: Option<u32>,
+            id: Option<String>,
+            phase: Option<String>,
+        }
+        if let Ok(parsed) = serde_json::from_str::<Permissive>(sig) {
+            if parsed.v == Some(1) {
+                if let Some(id) = parsed.id {
+                    let phase = match parsed.phase.as_deref() {
+                        Some("commentary") => Some(TextSignaturePhase::Commentary),
+                        Some("final_answer") => Some(TextSignaturePhase::FinalAnswer),
+                        _ => None,
+                    };
+                    return Some(ParsedTextSignature { id, phase });
+                }
             }
         }
         // Fall through to legacy plain-string handling
@@ -309,14 +322,14 @@ pub fn convert_responses_messages(
                             let parsed_sig =
                                 parse_text_signature(text_block.text_signature.as_deref());
                             let msg_id = match &parsed_sig {
-                                Some(ps) => {
+                                Some(ps) if !ps.id.is_empty() => {
                                     if ps.id.len() > 64 {
                                         format!("msg_{}", short_hash(&ps.id))
                                     } else {
                                         ps.id.clone()
                                     }
                                 }
-                                None => format!("msg_{}", msg_index),
+                                _ => format!("msg_{}", msg_index),
                             };
                             let phase = parsed_sig.as_ref().and_then(|ps| ps.phase.clone());
 
