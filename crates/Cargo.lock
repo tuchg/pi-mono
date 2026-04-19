@@ -2060,6 +2060,7 @@ dependencies = [
  "pi-agent-rs",
  "pi-ai-rs",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
