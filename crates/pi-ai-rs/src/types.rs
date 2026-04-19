@@ -411,43 +411,52 @@ pub enum AssistantMessageEvent {
     Start {
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     TextStart {
         content_index: usize,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     TextDelta {
         content_index: usize,
         delta: String,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     TextEnd {
         content_index: usize,
         content: String,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ThinkingStart {
         content_index: usize,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ThinkingDelta {
         content_index: usize,
         delta: String,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ThinkingEnd {
         content_index: usize,
         content: String,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ToolcallStart {
         content_index: usize,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ToolcallDelta {
         content_index: usize,
         delta: String,
         partial: AssistantMessage,
     },
+    #[serde(rename_all = "camelCase")]
     ToolcallEnd {
         content_index: usize,
         tool_call: ToolCall,
