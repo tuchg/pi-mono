@@ -2,28 +2,31 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Read an env var, treating empty strings as absent (matching JS `||` semantics).
+fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 /// Get API key for a provider from known environment variables.
 ///
 /// Port of `getEnvApiKey()` from `packages/ai/src/env-api-keys.ts`.
 pub fn get_env_api_key(provider: &str) -> Option<String> {
     match provider {
-        "github-copilot" => std::env::var("COPILOT_GITHUB_TOKEN")
-            .or_else(|_| std::env::var("GH_TOKEN"))
-            .or_else(|_| std::env::var("GITHUB_TOKEN"))
-            .ok(),
+        "github-copilot" => env_var_nonempty("COPILOT_GITHUB_TOKEN")
+            .or_else(|| env_var_nonempty("GH_TOKEN"))
+            .or_else(|| env_var_nonempty("GITHUB_TOKEN")),
 
-        "anthropic" => std::env::var("ANTHROPIC_OAUTH_TOKEN")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .ok(),
+        "anthropic" => env_var_nonempty("ANTHROPIC_OAUTH_TOKEN")
+            .or_else(|| env_var_nonempty("ANTHROPIC_API_KEY")),
 
         "google-vertex" => {
-            if let Ok(key) = std::env::var("GOOGLE_CLOUD_API_KEY") {
+            if let Some(key) = env_var_nonempty("GOOGLE_CLOUD_API_KEY") {
                 return Some(key);
             }
             let has_credentials = has_vertex_adc_credentials();
-            let has_project = std::env::var("GOOGLE_CLOUD_PROJECT").is_ok()
-                || std::env::var("GCLOUD_PROJECT").is_ok();
-            let has_location = std::env::var("GOOGLE_CLOUD_LOCATION").is_ok();
+            let has_project = env_var_nonempty("GOOGLE_CLOUD_PROJECT").is_some()
+                || env_var_nonempty("GCLOUD_PROJECT").is_some();
+            let has_location = env_var_nonempty("GOOGLE_CLOUD_LOCATION").is_some();
             if has_credentials && has_project && has_location {
                 Some("<authenticated>".to_string())
             } else {
@@ -32,13 +35,13 @@ pub fn get_env_api_key(provider: &str) -> Option<String> {
         }
 
         "amazon-bedrock" => {
-            if std::env::var("AWS_PROFILE").is_ok()
-                || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                    && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok())
-                || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
-                || std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
-                || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok()
-                || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok()
+            if env_var_nonempty("AWS_PROFILE").is_some()
+                || (env_var_nonempty("AWS_ACCESS_KEY_ID").is_some()
+                    && env_var_nonempty("AWS_SECRET_ACCESS_KEY").is_some())
+                || env_var_nonempty("AWS_BEARER_TOKEN_BEDROCK").is_some()
+                || env_var_nonempty("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
+                || env_var_nonempty("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
+                || env_var_nonempty("AWS_WEB_IDENTITY_TOKEN_FILE").is_some()
             {
                 Some("<authenticated>".to_string())
             } else {
@@ -50,7 +53,7 @@ pub fn get_env_api_key(provider: &str) -> Option<String> {
             let env_map = env_var_map();
             env_map
                 .get(provider)
-                .and_then(|var| std::env::var(var).ok())
+                .and_then(|var| env_var_nonempty(var))
         }
     }
 }
@@ -82,8 +85,8 @@ fn env_var_map() -> &'static HashMap<&'static str, &'static str> {
 
 /// Check if Google Vertex AI Application Default Credentials exist.
 fn has_vertex_adc_credentials() -> bool {
-    // Check GOOGLE_APPLICATION_CREDENTIALS env var first
-    if let Ok(gac_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+    // Check GOOGLE_APPLICATION_CREDENTIALS env var first (skip empty strings like TS)
+    if let Some(gac_path) = env_var_nonempty("GOOGLE_APPLICATION_CREDENTIALS") {
         return std::path::Path::new(&gac_path).exists();
     }
 
