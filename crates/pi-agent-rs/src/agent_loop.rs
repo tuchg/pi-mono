@@ -175,7 +175,7 @@ async fn run_loop(
             }
 
             // Stream assistant response.
-            let assistant = match stream_assistant_response(context, config, sender).await {
+            let assistant = match stream_assistant_response(context, config, sender, &cancel).await {
                 Some(msg) => msg,
                 None => {
                     sender.push(AgentEvent::AgentEnd {
@@ -218,7 +218,7 @@ async fn run_loop(
 
             let tool_results = if has_more_tool_calls {
                 let results =
-                    execute_tool_calls(context, &assistant, &tool_calls, config, sender).await;
+                    execute_tool_calls(context, &assistant, &tool_calls, config, sender, &cancel).await;
                 // Add tool result messages to context and new_messages.
                 for result in &results {
                     let tr_msg = AgentMessage::Standard(Message::ToolResult(result.clone()));
@@ -271,10 +271,11 @@ async fn stream_assistant_response(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
     sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> Option<AssistantMessage> {
     // Apply context transform if configured (AgentMessage[] → AgentMessage[]).
     let messages = if let Some(ref transform) = config.transform_context {
-        (transform)(context.messages.clone()).await
+        (transform)(context.messages.clone(), cancel.clone()).await
     } else {
         context.messages.clone()
     };
@@ -300,12 +301,22 @@ async fn stream_assistant_response(
         },
     };
 
-    let mut event_stream = match pi_ai_rs::stream_simple(&config.model, ai_context, stream_options)
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("stream_simple error: {e}");
-            return None;
+    // Use custom stream function if provided, otherwise default to stream_simple.
+    let mut event_stream = if let Some(ref stream_fn) = config.stream_fn {
+        match (stream_fn)(&config.model, ai_context, stream_options) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("custom stream_fn error: {e}");
+                return None;
+            }
+        }
+    } else {
+        match pi_ai_rs::stream_simple(&config.model, ai_context, stream_options) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("stream_simple error: {e}");
+                return None;
+            }
         }
     };
 
@@ -409,6 +420,7 @@ async fn execute_tool_calls(
     tool_calls: &[pi_ai_rs::ToolCall],
     config: &AgentLoopConfig,
     sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> Vec<pi_ai_rs::ToolResultMessage> {
     // Determine if any tool requests sequential execution.
     let has_sequential = tool_calls.iter().any(|tc| {
@@ -421,9 +433,9 @@ async fn execute_tool_calls(
     });
 
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential {
-        execute_tool_calls_sequential(context, assistant, tool_calls, config, sender).await
+        execute_tool_calls_sequential(context, assistant, tool_calls, config, sender, cancel).await
     } else {
-        execute_tool_calls_parallel(context, assistant, tool_calls, config, sender).await
+        execute_tool_calls_parallel(context, assistant, tool_calls, config, sender, cancel).await
     }
 }
 
@@ -433,6 +445,7 @@ async fn execute_tool_calls_sequential(
     tool_calls: &[pi_ai_rs::ToolCall],
     config: &AgentLoopConfig,
     sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> Vec<pi_ai_rs::ToolResultMessage> {
     let mut results = Vec::new();
 
@@ -443,7 +456,7 @@ async fn execute_tool_calls_sequential(
             args: tc.arguments.clone(),
         });
 
-        let outcome = prepare_and_execute(context, assistant, tc, config).await;
+        let outcome = prepare_and_execute(context, assistant, tc, config, sender, cancel).await;
         let result_msg = emit_tool_outcome(tc, outcome, sender).await;
         results.push(result_msg);
     }
@@ -457,6 +470,7 @@ async fn execute_tool_calls_parallel(
     tool_calls: &[pi_ai_rs::ToolCall],
     config: &AgentLoopConfig,
     sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> Vec<pi_ai_rs::ToolResultMessage> {
     // Emit tool_execution_start for all calls, prepare them, then run allowed
     // ones concurrently.  Finalize in original order (mirrors TS parallel impl).
@@ -470,13 +484,15 @@ async fn execute_tool_calls_parallel(
             args: tc.arguments.clone(),
         });
 
-        match prepare_tool_call(context, assistant, tc, config).await {
+        match prepare_tool_call(context, assistant, tc, config, cancel).await {
             PrepareResult::Immediate(outcome) => immediate.push((i, outcome)),
             PrepareResult::Prepared(prepared) => deferred.push((i, tc.clone(), prepared)),
         }
     }
 
     // Execute deferred calls concurrently.
+    // Note: we cannot emit tool_execution_update events from parallel tasks
+    // back through the sender (which requires &mut). We collect them post-hoc.
     let deferred_futures: Vec<_> = deferred
         .iter()
         .map(|(_, tc, prepared)| execute_prepared(tc, prepared))
@@ -499,7 +515,12 @@ async fn execute_tool_calls_parallel(
     for (i, outcome_opt) in ordered.into_iter().enumerate() {
         let outcome = outcome_opt.expect("every tool call must have an outcome");
         let tc = &tool_calls[i];
-        let outcome = apply_after_hook(context, assistant, tc, outcome, config).await;
+        // Find the validated args from the deferred prepared call if available.
+        let validated_args = deferred
+            .iter()
+            .find(|(idx, _, _)| *idx == i)
+            .map(|(_, _, p)| p.args.clone());
+        let outcome = apply_after_hook(context, assistant, tc, validated_args, outcome, config, cancel).await;
         let result_msg = emit_tool_outcome(tc, outcome, sender).await;
         results.push(result_msg);
     }
@@ -532,13 +553,16 @@ async fn prepare_and_execute(
     assistant: &AssistantMessage,
     tc: &pi_ai_rs::ToolCall,
     config: &AgentLoopConfig,
+    sender: &mut AgentEventStreamSender,
+    cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let prepare = prepare_tool_call(context, assistant, tc, config).await;
+    let prepare = prepare_tool_call(context, assistant, tc, config, cancel).await;
     match prepare {
         PrepareResult::Immediate(outcome) => outcome,
         PrepareResult::Prepared(prepared) => {
-            let outcome = execute_prepared(tc, &prepared).await;
-            apply_after_hook(context, assistant, tc, outcome, config).await
+            let validated_args = prepared.args.clone();
+            let outcome = execute_prepared_with_updates(tc, &prepared, sender).await;
+            apply_after_hook(context, assistant, tc, Some(validated_args), outcome, config, cancel).await
         }
     }
 }
@@ -549,6 +573,7 @@ async fn prepare_tool_call(
     assistant: &AssistantMessage,
     tc: &pi_ai_rs::ToolCall,
     config: &AgentLoopConfig,
+    cancel: &CancellationToken,
 ) -> PrepareResult {
     // Find the tool.
     let tool = match context.tools.iter().find(|t| t.name() == tc.name) {
@@ -590,7 +615,7 @@ async fn prepare_tool_call(
                 tools: context.tools.clone(),
             },
         };
-        match (before)(before_ctx).await {
+        match (before)(before_ctx, cancel.clone()).await {
             Some(result) if result.block == Some(true) => {
                 let reason = result
                     .reason
@@ -607,7 +632,7 @@ async fn prepare_tool_call(
     PrepareResult::Prepared(PreparedToolCall { tool, args })
 }
 
-/// Execute a prepared tool call.
+/// Execute a prepared tool call without update events (used in parallel mode).
 async fn execute_prepared(
     tc: &pi_ai_rs::ToolCall,
     prepared: &PreparedToolCall,
@@ -628,19 +653,82 @@ async fn execute_prepared(
     }
 }
 
+/// Execute a prepared tool call with update events (used in sequential mode).
+///
+/// Mirrors TS `executePreparedToolCall` which passes an `onUpdate` callback
+/// that emits `tool_execution_update` events.
+async fn execute_prepared_with_updates(
+    tc: &pi_ai_rs::ToolCall,
+    prepared: &PreparedToolCall,
+    sender: &mut AgentEventStreamSender,
+) -> ToolOutcome {
+    let tool_call_id = tc.id.clone();
+    let tool_name = tc.name.clone();
+    let tool_args = tc.arguments.clone();
+
+    let sender_tool_call_id = tool_call_id.clone();
+    let sender_tool_name = tool_name.clone();
+    let sender_tool_args = tool_args.clone();
+
+    // Collect update events for emission after execution.
+    let updates: std::sync::Arc<std::sync::Mutex<Vec<AgentToolResult>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let updates_clone = updates.clone();
+
+    let on_update: crate::types::AgentToolUpdateCallback = Box::new(move |partial_result| {
+        updates_clone
+            .lock()
+            .expect("updates lock poisoned")
+            .push(partial_result.clone());
+    });
+
+    let result = prepared
+        .tool
+        .execute(&tc.id, prepared.args.clone(), Some(on_update))
+        .await;
+
+    // Emit collected update events.
+    let collected_updates = updates.lock().expect("updates lock poisoned").clone();
+    for update in collected_updates {
+        sender.push(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: sender_tool_call_id.clone(),
+            tool_name: sender_tool_name.clone(),
+            args: sender_tool_args.clone(),
+            partial_result: serde_json::to_value(&update).unwrap_or_default(),
+        });
+    }
+
+    match result {
+        Ok(result) => ToolOutcome {
+            result,
+            is_error: false,
+        },
+        Err(e) => ToolOutcome {
+            result: error_result(&e.to_string()),
+            is_error: true,
+        },
+    }
+}
+
 /// Apply the `after_tool_call` hook and merge any overrides.
+///
+/// `validated_args` should be the args after `prepare_arguments` + schema
+/// validation, matching the TS behavior (TS passes `prepared.args`).
 async fn apply_after_hook(
     context: &AgentContext,
     assistant: &AssistantMessage,
     tc: &pi_ai_rs::ToolCall,
+    validated_args: Option<serde_json::Value>,
     mut outcome: ToolOutcome,
     config: &AgentLoopConfig,
+    cancel: &CancellationToken,
 ) -> ToolOutcome {
     if let Some(ref after) = config.after_tool_call {
         let after_ctx = AfterToolCallContext {
             assistant_message: assistant.clone(),
             tool_call: tc.clone(),
-            args: tc.arguments.clone(),
+            // Use validated args if available, otherwise fall back to raw args.
+            args: validated_args.unwrap_or_else(|| tc.arguments.clone()),
             result: outcome.result.clone(),
             is_error: outcome.is_error,
             context: AgentContext {
@@ -650,7 +738,8 @@ async fn apply_after_hook(
                 tools: context.tools.clone(),
             },
         };
-        match (after)(after_ctx).await {
+        // TS wraps afterToolCall in try-catch; replicate with catch_unwind-style error handling.
+        match (after)(after_ctx, cancel.clone()).await {
             Some(overrides) => {
                 if let Some(content) = overrides.content {
                     outcome.result.content = content;

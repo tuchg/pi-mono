@@ -10,7 +10,7 @@ use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentLoopConfig,
     AgentMessage, AgentState, AgentTool, AfterToolCallFn, BeforeToolCallContext,
     BeforeToolCallResult, BeforeToolCallFn, BoxFuture, ConvertToLlmFn, GetApiKeyFn,
-    GetMessagesFn, Message, QueueMode, ToolExecutionMode, TransformContextFn,
+    GetMessagesFn, Message, QueueMode, StreamFn, ToolExecutionMode, TransformContextFn,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,8 @@ pub struct AgentOptions {
     pub convert_to_llm: Option<ConvertToLlmFn>,
     /// Optional context transform applied before `convert_to_llm`.
     pub transform_context: Option<TransformContextFn>,
+    /// Custom stream function, overriding `pi_ai_rs::stream_simple`.
+    pub stream_fn: Option<StreamFn>,
     /// Resolves an API key dynamically for each LLM call.
     pub get_api_key: Option<GetApiKeyFn>,
     /// Called before each tool execution.
@@ -103,6 +105,7 @@ impl Default for AgentOptions {
             initial_state: None,
             convert_to_llm: None,
             transform_context: None,
+            stream_fn: None,
             get_api_key: None,
             before_tool_call: None,
             after_tool_call: None,
@@ -132,13 +135,14 @@ impl Default for AgentOptions {
 /// Mirrors the TypeScript `Agent` class from `packages/agent/src/agent.ts`.
 pub struct Agent {
     state: AgentState,
-    tools: Vec<Arc<dyn AgentTool>>,
     steering_queue: Arc<Mutex<PendingMessageQueue>>,
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
 
     // Public fields — mirror TS public fields on `Agent`.
     pub convert_to_llm: ConvertToLlmFn,
     pub transform_context: Option<TransformContextFn>,
+    /// Custom stream function, overriding `pi_ai_rs::stream_simple`.
+    pub stream_fn: Option<StreamFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
@@ -155,6 +159,8 @@ pub struct Agent {
 
     // Active run cancellation token (None when idle).
     cancel: Option<CancellationToken>,
+    // Active run completion notifier.
+    idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Agent {
@@ -178,7 +184,6 @@ impl Agent {
 
         Self {
             state: initial_state,
-            tools: Vec::new(),
             steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(
                 options.steering_mode,
             ))),
@@ -187,6 +192,7 @@ impl Agent {
             ))),
             convert_to_llm,
             transform_context: options.transform_context,
+            stream_fn: options.stream_fn,
             get_api_key: options.get_api_key,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
@@ -199,6 +205,7 @@ impl Agent {
             listeners: Vec::new(),
             next_listener_id: 0,
             cancel: None,
+            idle_notify: None,
         }
     }
 
@@ -222,12 +229,12 @@ impl Agent {
 
     /// Register a tool.
     pub fn add_tool(&mut self, tool: Arc<dyn AgentTool>) {
-        self.tools.push(tool);
+        self.state.tools.push(tool);
     }
 
     /// Remove all registered tools.
     pub fn clear_tools(&mut self) {
-        self.tools.clear();
+        self.state.tools.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -319,6 +326,15 @@ impl Agent {
         }
     }
 
+    /// Wait for the current run to complete.
+    ///
+    /// Resolves immediately if no run is active. Mirrors TS `waitForIdle()`.
+    pub async fn wait_for_idle(&self) {
+        if let Some(ref notify) = self.idle_notify {
+            notify.notified().await;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Listener subscription
     // -----------------------------------------------------------------------
@@ -370,6 +386,40 @@ impl Agent {
         messages: Vec<AgentMessage>,
     ) -> Result<(), anyhow::Error> {
         self.run_prompt_messages(messages, false).await
+    }
+
+    /// Convenience: start a new run from a plain text string.
+    ///
+    /// Creates a user message with the given text and optional images.
+    /// Mirrors the TS `prompt(input: string, images?: ImageContent[])` overload.
+    pub async fn prompt_text(
+        &mut self,
+        text: &str,
+        images: Option<Vec<pi_ai_rs::Content>>,
+    ) -> Result<(), anyhow::Error> {
+        let mut parts: Vec<pi_ai_rs::UserContentPart> = vec![
+            pi_ai_rs::UserContentPart::Text(pi_ai_rs::TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            }),
+        ];
+        if let Some(imgs) = images {
+            for img in imgs {
+                if let pi_ai_rs::Content::Image(ic) = img {
+                    parts.push(pi_ai_rs::UserContentPart::Image(ic));
+                }
+            }
+        }
+        let user_msg = AgentMessage::Standard(Message::User(pi_ai_rs::UserMessage {
+            content: if parts.len() == 1 {
+                // Single text part → use simpler Text variant.
+                pi_ai_rs::UserContent::Text(text.to_string())
+            } else {
+                pi_ai_rs::UserContent::Parts(parts)
+            },
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        }));
+        self.prompt(user_msg).await
     }
 
     /// Continue from the current transcript.
@@ -437,7 +487,7 @@ impl Agent {
         self.begin_run();
 
         let cancel = self.cancel.as_ref().expect("cancel must be set").clone();
-        let mut stream = agent_loop(messages, context, config, cancel);
+        let mut stream = agent_loop(messages, context, config, cancel.clone());
 
         while let Some(event) = stream.next().await {
             self.process_event(event).await;
@@ -469,46 +519,23 @@ impl Agent {
     }
 
     fn create_context_snapshot(&self) -> AgentContext {
-        let tool_definitions = self.tools.iter().map(|t| t.as_tool_definition()).collect();
+        let tool_definitions = self.state.tools.iter().map(|t| t.as_tool_definition()).collect();
         AgentContext {
             system_prompt: self.state.system_prompt.clone(),
             messages: self.state.messages.clone(),
             tool_definitions,
-            tools: self.tools.clone(),
+            tools: self.state.tools.clone(),
         }
     }
 
     fn create_loop_config(&self, skip_initial_steering_poll: bool) -> AgentLoopConfig {
-        let steering_arc = Arc::clone(&self.steering_queue);
-        let follow_up_arc = Arc::clone(&self.follow_up_queue);
-
-        let mut skip = skip_initial_steering_poll;
-
-        let get_steering: GetMessagesFn = Arc::new(move || {
-            let sq = Arc::clone(&steering_arc);
-            let current_skip = skip;
-            // After the first call, never skip again.
-            // Note: `skip` is captured by move; update happens on next call.
-            Box::pin(async move {
-                if current_skip {
-                    return Vec::new();
-                }
-                sq.lock().expect("steering queue poisoned").drain()
-            }) as BoxFuture<'static, Vec<AgentMessage>>
-        });
-        // Advance skip flag after building the closure (first poll will skip once).
-        // Because closures in Rust capture variables by copy for `bool`, we
-        // can't toggle inside the closure.  Instead we use a shared atomic.
-        // For simplicity, rebuild the closure below with an Arc<AtomicBool>.
-        drop(get_steering);
-
         // TS: `skipInitialSteeringPoll` is a local `let mut` that flips on first call.
         // Rust: model with an Arc<AtomicBool> so the closure can toggle it.
         use std::sync::atomic::{AtomicBool, Ordering};
         let skip_flag = Arc::new(AtomicBool::new(skip_initial_steering_poll));
-        let steering_arc2 = Arc::clone(&self.steering_queue);
+        let steering_arc = Arc::clone(&self.steering_queue);
         let get_steering: GetMessagesFn = Arc::new(move || {
-            let sq = Arc::clone(&steering_arc2);
+            let sq = Arc::clone(&steering_arc);
             let flag = Arc::clone(&skip_flag);
             Box::pin(async move {
                 if flag.swap(false, Ordering::SeqCst) {
@@ -518,9 +545,9 @@ impl Agent {
             }) as BoxFuture<'static, Vec<AgentMessage>>
         });
 
-        let follow_up_arc2 = Arc::clone(&self.follow_up_queue);
+        let follow_up_arc = Arc::clone(&self.follow_up_queue);
         let get_follow_up: GetMessagesFn = Arc::new(move || {
-            let fq = Arc::clone(&follow_up_arc2);
+            let fq = Arc::clone(&follow_up_arc);
             Box::pin(async move {
                 fq.lock().expect("follow-up queue poisoned").drain()
             }) as BoxFuture<'static, Vec<AgentMessage>>
@@ -531,7 +558,7 @@ impl Agent {
 
         let transform_context = self.transform_context.as_ref().map(|f| {
             let f = Arc::clone(f);
-            Arc::new(move |msgs| (f)(msgs)) as TransformContextFn
+            Arc::new(move |msgs, cancel| (f)(msgs, cancel)) as TransformContextFn
         });
 
         let get_api_key = self.get_api_key.as_ref().map(|f| {
@@ -541,12 +568,12 @@ impl Agent {
 
         let before_tool_call = self.before_tool_call.as_ref().map(|f| {
             let f = Arc::clone(f);
-            Arc::new(move |ctx| (f)(ctx)) as BeforeToolCallFn
+            Arc::new(move |ctx, cancel| (f)(ctx, cancel)) as BeforeToolCallFn
         });
 
         let after_tool_call = self.after_tool_call.as_ref().map(|f| {
             let f = Arc::clone(f);
-            Arc::new(move |ctx| (f)(ctx)) as AfterToolCallFn
+            Arc::new(move |ctx, cancel| (f)(ctx, cancel)) as AfterToolCallFn
         });
 
         let mut stream_options = pi_ai_rs::SimpleStreamOptions::default();
@@ -570,11 +597,13 @@ impl Agent {
             tool_execution: self.tool_execution,
             before_tool_call,
             after_tool_call,
+            stream_fn: self.stream_fn.as_ref().map(Arc::clone),
         }
     }
 
     fn begin_run(&mut self) {
         self.cancel = Some(CancellationToken::new());
+        self.idle_notify = Some(Arc::new(tokio::sync::Notify::new()));
         self.state.is_streaming = true;
         self.state.streaming_message = None;
         self.state.error_message = None;
@@ -584,7 +613,11 @@ impl Agent {
         self.state.is_streaming = false;
         self.state.streaming_message = None;
         self.state.pending_tool_calls = HashSet::new();
+        if let Some(ref notify) = self.idle_notify {
+            notify.notify_waiters();
+        }
         self.cancel = None;
+        self.idle_notify = None;
     }
 
     /// Update internal state for a loop event, then invoke listeners.

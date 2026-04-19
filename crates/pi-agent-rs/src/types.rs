@@ -11,9 +11,25 @@ use pi_ai_rs::{
     Tool, ToolResultMessage,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 // Re-export the AI-layer message type.
 pub use pi_ai_rs::types::Message;
+pub use pi_ai_rs::event_stream::AssistantMessageEventStreamReceiver;
+
+// ---------------------------------------------------------------------------
+// StreamFn type
+// ---------------------------------------------------------------------------
+
+/// Custom stream function matching the `stream_simple` signature.
+///
+/// Allows apps to inject custom stream implementations (e.g., proxy streams)
+/// instead of using `pi_ai_rs::stream_simple` directly.
+pub type StreamFn = Arc<
+    dyn Fn(&Model, pi_ai_rs::Context, SimpleStreamOptions) -> Result<AssistantMessageEventStreamReceiver, pi_ai_rs::AiError>
+        + Send
+        + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Agent-level enums
@@ -23,8 +39,9 @@ pub use pi_ai_rs::types::Message;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolExecutionMode {
-    #[default]
     Sequential,
+    /// TS default: "parallel"
+    #[default]
     Parallel,
 }
 
@@ -236,16 +253,34 @@ impl std::fmt::Debug for AgentContext {
 // ---------------------------------------------------------------------------
 
 /// Observable agent state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentState {
     pub system_prompt: String,
     pub model: Model,
     pub thinking_level: AgentThinkingLevel,
+    /// Available tools. Mirrors TS `AgentState.tools`.
+    pub tools: Vec<Arc<dyn AgentTool>>,
     pub messages: Vec<AgentMessage>,
     pub is_streaming: bool,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<String>,
     pub error_message: Option<String>,
+}
+
+impl std::fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentState")
+            .field("system_prompt", &self.system_prompt)
+            .field("model", &self.model)
+            .field("thinking_level", &self.thinking_level)
+            .field("tools", &self.tools.iter().map(|t| t.name()).collect::<Vec<_>>())
+            .field("messages", &self.messages)
+            .field("is_streaming", &self.is_streaming)
+            .field("streaming_message", &self.streaming_message)
+            .field("pending_tool_calls", &self.pending_tool_calls)
+            .field("error_message", &self.error_message)
+            .finish()
+    }
 }
 
 impl Default for AgentState {
@@ -254,6 +289,7 @@ impl Default for AgentState {
             system_prompt: String::new(),
             model: Model::default(),
             thinking_level: AgentThinkingLevel::Off,
+            tools: Vec::new(),
             messages: Vec::new(),
             is_streaming: false,
             streaming_message: None,
@@ -326,18 +362,18 @@ impl AgentEvent {
 pub type ConvertToLlmFn =
     Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
 pub type TransformContextFn =
-    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+    Arc<dyn Fn(Vec<AgentMessage>, CancellationToken) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 pub type GetApiKeyFn =
     Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 pub type GetMessagesFn =
     Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 pub type BeforeToolCallFn = Arc<
-    dyn Fn(BeforeToolCallContext) -> BoxFuture<'static, Option<BeforeToolCallResult>>
+    dyn Fn(BeforeToolCallContext, CancellationToken) -> BoxFuture<'static, Option<BeforeToolCallResult>>
         + Send
         + Sync,
 >;
 pub type AfterToolCallFn = Arc<
-    dyn Fn(AfterToolCallContext) -> BoxFuture<'static, Option<AfterToolCallResult>>
+    dyn Fn(AfterToolCallContext, CancellationToken) -> BoxFuture<'static, Option<AfterToolCallResult>>
         + Send
         + Sync,
 >;
@@ -354,4 +390,6 @@ pub struct AgentLoopConfig {
     pub tool_execution: ToolExecutionMode,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// Optional custom stream function, overriding `pi_ai_rs::stream_simple`.
+    pub stream_fn: Option<StreamFn>,
 }

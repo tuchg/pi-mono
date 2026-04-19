@@ -94,6 +94,7 @@ impl Harness {
             tool_execution: ToolExecutionMode::Sequential,
             before_tool_call: None,
             after_tool_call: None,
+            stream_fn: None,
         };
 
         let cancel = CancellationToken::new();
