@@ -17,14 +17,21 @@ use crate::utils::sanitize_unicode::sanitize_surrogates;
 /// Map OpenAI Chat Completion finish reason to our StopReason.
 pub fn map_completions_stop_reason(reason: &str) -> (StopReason, Option<String>) {
     match reason {
-        "stop" => (StopReason::Stop, None),
+        "stop" | "end" => (StopReason::Stop, None),
         "length" => (StopReason::Length, None),
         "tool_calls" | "function_call" => (StopReason::ToolUse, None),
         "content_filter" => (
             StopReason::Error,
-            Some("Content filtered by safety system".to_string()),
+            Some("Provider finish_reason: content_filter".to_string()),
         ),
-        _ => (StopReason::Error, None),
+        "network_error" => (
+            StopReason::Error,
+            Some("Provider finish_reason: network_error".to_string()),
+        ),
+        other => (
+            StopReason::Error,
+            Some(format!("Provider finish_reason: {other}")),
+        ),
     }
 }
 
@@ -106,18 +113,23 @@ pub fn convert_completions_messages(
             crate::types::Message::Assistant(assistant_msg) => {
                 let mut content_text = String::new();
                 let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-                let mut reasoning_text = String::new();
+                let mut thinking_parts: Vec<String> = Vec::new();
+                let mut thinking_signature: Option<String> = None;
 
                 for block in &assistant_msg.content {
                     match block {
                         AssistantContent::Text(t) => {
-                            content_text.push_str(&sanitize_surrogates(&t.text));
+                            if !t.text.trim().is_empty() {
+                                content_text.push_str(&sanitize_surrogates(&t.text));
+                            }
                         }
                         AssistantContent::Thinking(t) => {
-                            if !reasoning_text.is_empty() {
-                                reasoning_text.push_str("\n\n");
+                            if !t.thinking.trim().is_empty() {
+                                thinking_parts.push(sanitize_surrogates(&t.thinking));
+                                if thinking_signature.is_none() {
+                                    thinking_signature = t.thinking_signature.clone();
+                                }
                             }
-                            reasoning_text.push_str(&sanitize_surrogates(&t.thinking));
                         }
                         AssistantContent::ToolCall(tc) => {
                             tool_calls.push(serde_json::json!({
@@ -132,13 +144,32 @@ pub fn convert_completions_messages(
                     }
                 }
 
+                // Skip assistant messages with no content and no tool calls.
+                let has_content = !content_text.is_empty();
+                if !has_content && tool_calls.is_empty() {
+                    continue;
+                }
+
                 let mut msg = serde_json::json!({"role": "assistant"});
-                if !content_text.is_empty() || tool_calls.is_empty() {
+                if has_content {
                     msg["content"] = serde_json::Value::String(content_text);
+                } else {
+                    msg["content"] = serde_json::Value::Null;
                 }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = serde_json::json!(tool_calls);
                 }
+
+                // Include thinking/reasoning via the signature field name
+                // (e.g., "reasoning_content", "reasoning") when available.
+                if !thinking_parts.is_empty() {
+                    if let Some(ref sig) = thinking_signature {
+                        if !sig.is_empty() {
+                            msg[sig] = serde_json::Value::String(thinking_parts.join("\n"));
+                        }
+                    }
+                }
+
                 messages.push(msg);
             }
             crate::types::Message::ToolResult(tr) => {
@@ -197,18 +228,33 @@ pub fn parse_chunk_usage(
 ) -> crate::types::Usage {
     let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
     let completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
-    let total_tokens = usage["total_tokens"]
+    let reported_cached = usage["prompt_tokens_details"]["cached_tokens"]
         .as_u64()
-        .unwrap_or(prompt_tokens + completion_tokens);
-    let cached = usage["prompt_tokens_details"]["cached_tokens"]
+        .unwrap_or(0);
+    let cache_write = usage["prompt_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    let reasoning_tokens = usage["completion_tokens_details"]["reasoning_tokens"]
         .as_u64()
         .unwrap_or(0);
 
+    // Normalize cache semantics: some providers report cached_tokens as
+    // (previous hits + current writes). Subtract cacheWrite when present.
+    let cache_read = if cache_write > 0 {
+        reported_cached.saturating_sub(cache_write)
+    } else {
+        reported_cached
+    };
+
+    let input = prompt_tokens.saturating_sub(cache_read).saturating_sub(cache_write);
+    let output = completion_tokens + reasoning_tokens;
+    let total_tokens = input + output + cache_read + cache_write;
+
     let mut u = crate::types::Usage {
-        input: prompt_tokens.saturating_sub(cached),
-        output: completion_tokens,
-        cache_read: cached,
-        cache_write: 0,
+        input,
+        output,
+        cache_read,
+        cache_write,
         total_tokens,
         cost: crate::types::UsageCost::default(),
     };
@@ -244,6 +290,14 @@ mod tests {
     }
 
     #[test]
+    fn stop_reason_end() {
+        assert_eq!(
+            map_completions_stop_reason("end"),
+            (StopReason::Stop, None)
+        );
+    }
+
+    #[test]
     fn stop_reason_length() {
         assert_eq!(
             map_completions_stop_reason("length"),
@@ -263,7 +317,24 @@ mod tests {
     fn stop_reason_content_filter() {
         let (reason, msg) = map_completions_stop_reason("content_filter");
         assert_eq!(reason, StopReason::Error);
-        assert!(msg.is_some());
+        assert_eq!(msg.as_deref(), Some("Provider finish_reason: content_filter"));
+    }
+
+    #[test]
+    fn stop_reason_network_error() {
+        let (reason, msg) = map_completions_stop_reason("network_error");
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(msg.as_deref(), Some("Provider finish_reason: network_error"));
+    }
+
+    #[test]
+    fn stop_reason_unknown_includes_reason() {
+        let (reason, msg) = map_completions_stop_reason("something_weird");
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(
+            msg.as_deref(),
+            Some("Provider finish_reason: something_weird")
+        );
     }
 
     #[test]
