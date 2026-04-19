@@ -3,6 +3,10 @@
 /// Port of the TypeScript `shortHash()` from `packages/ai/src/utils/hash.ts`.
 /// Uses a pair of multiply-xorshift hashes (FNV-like) and encodes the two
 /// 32-bit halves as base-36 strings.
+///
+/// Note: JavaScript `Math.imul(a, b)` performs signed 32-bit multiplication,
+/// but since the low 32 bits of a*b are identical for signed and unsigned,
+/// Rust `u32::wrapping_mul` produces the same result.
 pub fn short_hash(s: &str) -> String {
     let mut h1: u32 = 0xdeadbeef;
     let mut h2: u32 = 0x41c6ce57;
@@ -13,6 +17,7 @@ pub fn short_hash(s: &str) -> String {
         h2 = (h2 ^ c).wrapping_mul(1597334677);
     }
 
+    // Sequential: h1 is updated first, then h2 uses the NEW h1 (matches TS behavior).
     h1 = (h1 ^ (h1 >> 16)).wrapping_mul(2246822507) ^ (h2 ^ (h2 >> 13)).wrapping_mul(3266489909);
     h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2246822507) ^ (h1 ^ (h1 >> 13)).wrapping_mul(3266489909);
 
@@ -41,21 +46,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_string() {
-        // Deterministic: same input always gives same output.
-        let h = short_hash("");
-        assert!(!h.is_empty());
-        assert_eq!(h, short_hash(""));
+    fn matches_typescript_empty() {
+        assert_eq!(short_hash(""), "k4n83c7h0j2b");
+    }
+
+    #[test]
+    fn matches_typescript_hello() {
+        assert_eq!(short_hash("hello"), "1h6qa0qrowduu");
+    }
+
+    #[test]
+    fn matches_typescript_emoji() {
+        assert_eq!(short_hash("Hello 🙈 World"), "11begrz17n9aby");
     }
 
     #[test]
     fn different_inputs_differ() {
         assert_ne!(short_hash("hello"), short_hash("world"));
-    }
-
-    #[test]
-    fn handles_unicode() {
-        let h = short_hash("Hello 🙈 World");
-        assert!(!h.is_empty());
     }
 }
