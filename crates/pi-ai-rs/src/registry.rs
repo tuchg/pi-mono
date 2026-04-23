@@ -77,34 +77,48 @@ pub fn register_api_provider(provider: ApiProvider, source_id: Option<&str>) {
 
     let mut registry = global_registry().write().expect("registry poisoned");
     registry.insert(
-        api,
+        api.clone(),
         RegisteredProvider {
             provider: Arc::new(wrapped_provider),
             source_id: source_id.map(String::from),
         },
     );
+    tracing::info!(api = %api, source_id, provider_count = registry.len(), "registered API provider");
 }
 
 /// Look up the provider for a given API identifier.
 pub fn get_api_provider(api: &str) -> Option<Arc<ApiProvider>> {
     let registry = global_registry().read().expect("registry poisoned");
-    registry.get(api).map(|r| Arc::clone(&r.provider))
+    let provider = registry.get(api).map(|r| Arc::clone(&r.provider));
+    tracing::debug!(api, found = provider.is_some(), "looked up API provider");
+    provider
 }
 
 /// Return all currently registered providers.
 pub fn get_api_providers() -> Vec<Arc<ApiProvider>> {
     let registry = global_registry().read().expect("registry poisoned");
-    registry.values().map(|r| Arc::clone(&r.provider)).collect()
+    let providers: Vec<_> = registry.values().map(|r| Arc::clone(&r.provider)).collect();
+    tracing::debug!(provider_count = providers.len(), "listed API providers");
+    providers
 }
 
 /// Remove all providers that were registered with the given `source_id`.
 pub fn unregister_api_providers(source_id: &str) {
     let mut registry = global_registry().write().expect("registry poisoned");
+    let before = registry.len();
     registry.retain(|_, r| r.source_id.as_deref() != Some(source_id));
+    tracing::info!(
+        source_id,
+        removed = before.saturating_sub(registry.len()),
+        provider_count = registry.len(),
+        "unregistered API providers by source",
+    );
 }
 
 /// Remove all registered providers.
 pub fn clear_api_providers() {
     let mut registry = global_registry().write().expect("registry poisoned");
+    let cleared = registry.len();
     registry.clear();
+    tracing::info!(cleared, "cleared API providers");
 }

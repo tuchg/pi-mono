@@ -32,6 +32,13 @@ pub fn agent_loop(
     config: AgentLoopConfig,
     cancel: CancellationToken,
 ) -> AgentEventStream {
+    tracing::info!(
+        prompt_count = prompts.len(),
+        existing_message_count = context.messages.len(),
+        model = %config.model.id,
+        provider = %config.model.provider,
+        "starting agent loop",
+    );
     let (mut sender, receiver) = create_agent_stream();
 
     tokio::spawn(async move {
@@ -51,6 +58,12 @@ pub fn agent_loop_continue(
     config: AgentLoopConfig,
     cancel: CancellationToken,
 ) -> AgentEventStream {
+    tracing::info!(
+        message_count = context.messages.len(),
+        model = %config.model.id,
+        provider = %config.model.provider,
+        "continuing agent loop",
+    );
     if context.messages.is_empty() {
         let (mut sender, receiver) = create_agent_stream();
         sender.end(Some(Vec::new()));
@@ -175,6 +188,11 @@ async fn run_loop(
             }
 
             // Stream assistant response.
+            tracing::debug!(
+                context_message_count = context.messages.len(),
+                pending_message_count = pending.len(),
+                "streaming assistant response",
+            );
             let assistant = match stream_assistant_response(context, config, sender, &cancel).await {
                 Some(msg) => msg,
                 None => {
@@ -215,6 +233,11 @@ async fn run_loop(
                 .collect();
 
             has_more_tool_calls = !tool_calls.is_empty();
+            tracing::debug!(
+                tool_call_count = tool_calls.len(),
+                stop_reason = ?assistant.stop_reason,
+                "assistant response received",
+            );
 
             let tool_results = if has_more_tool_calls {
                 let results =
@@ -431,6 +454,12 @@ async fn execute_tool_calls(
             .and_then(|t| t.execution_mode())
             == Some(ToolExecutionMode::Sequential)
     });
+    tracing::debug!(
+        tool_call_count = tool_calls.len(),
+        has_sequential,
+        configured_mode = ?config.tool_execution,
+        "executing tool calls",
+    );
 
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential {
         execute_tool_calls_sequential(context, assistant, tool_calls, config, sender, cancel).await

@@ -8,6 +8,13 @@ pub fn stream(
     context: Context,
     options: StreamOptions,
 ) -> Result<AssistantMessageEventStreamReceiver, AiError> {
+    tracing::debug!(
+        api = %model.api,
+        model_id = %model.id,
+        message_count = context.messages.len(),
+        has_tools = context.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        "starting provider stream",
+    );
     let provider =
         get_api_provider(&model.api).ok_or_else(|| AiError::NoProvider {
             api: model.api.clone(),
@@ -21,6 +28,7 @@ pub async fn complete(
     context: Context,
     options: StreamOptions,
 ) -> Result<AssistantMessage, AiError> {
+    tracing::debug!(api = %model.api, model_id = %model.id, "collecting streamed assistant response");
     let s = stream(model, context, options)?;
     s.result()
         .await
@@ -35,6 +43,13 @@ pub fn stream_simple(
     context: Context,
     options: SimpleStreamOptions,
 ) -> Result<AssistantMessageEventStreamReceiver, AiError> {
+    tracing::debug!(
+        api = %model.api,
+        model_id = %model.id,
+        message_count = context.messages.len(),
+        has_tools = context.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        "starting provider simple stream",
+    );
     let provider =
         get_api_provider(&model.api).ok_or_else(|| AiError::NoProvider {
             api: model.api.clone(),
@@ -48,6 +63,7 @@ pub async fn complete_simple(
     context: Context,
     options: SimpleStreamOptions,
 ) -> Result<AssistantMessage, AiError> {
+    tracing::debug!(api = %model.api, model_id = %model.id, "collecting streamed assistant simple response");
     let s = stream_simple(model, context, options)?;
     s.result()
         .await

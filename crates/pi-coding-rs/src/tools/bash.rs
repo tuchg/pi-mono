@@ -50,6 +50,12 @@ impl AgentTool for BashTool {
                 .unwrap_or("")
                 .to_string();
             let timeout_secs = params["timeout"].as_f64();
+            tracing::debug!(
+                cwd = %self.cwd,
+                command_len = command.len(),
+                timeout_secs,
+                "executing bash tool",
+            );
 
             let child = tokio::process::Command::new("bash")
                 .arg("-c")
@@ -66,9 +72,11 @@ impl AgentTool for BashTool {
                 tokio::select! {
                     res = output_future => Ok(res?),
                     _ = tokio::time::sleep(duration) => {
+                        tracing::warn!(cwd = %self.cwd, timeout_secs = secs, "bash tool timed out");
                         Err(anyhow::anyhow!("Command timed out after {secs} seconds"))
                     }
                     _ = cancel.cancelled() => {
+                        tracing::warn!(cwd = %self.cwd, "bash tool cancelled");
                         Err(anyhow::anyhow!("Command aborted"))
                     }
                 }
@@ -76,6 +84,7 @@ impl AgentTool for BashTool {
                 tokio::select! {
                     res = output_future => Ok(res?),
                     _ = cancel.cancelled() => {
+                        tracing::warn!(cwd = %self.cwd, "bash tool cancelled");
                         Err(anyhow::anyhow!("Command aborted"))
                     }
                 }
@@ -86,6 +95,7 @@ impl AgentTool for BashTool {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
             let exit_code = output.status.code().unwrap_or(-1);
+            tracing::debug!(cwd = %self.cwd, exit_code, "bash tool finished");
             let mut text = if stdout.is_empty() && stderr.is_empty() {
                 "(no output)".to_string()
             } else if stderr.is_empty() {
