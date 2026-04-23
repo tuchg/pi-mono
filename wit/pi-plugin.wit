@@ -1,0 +1,252 @@
+/// WIT (WebAssembly Interface Types) definition for the pi plugin system.
+///
+/// This interface defines the contract between the pi host runtime and
+/// WASM-based plugins (extensions). Plugins can be written in any language
+/// that compiles to WASM Components (Rust, Go, Python, JS/TS via Javy).
+///
+/// The interface is versioned and follows semver for backward compatibility.
+
+package pi:plugin@0.1.0;
+
+/// Core types shared across all pi interfaces.
+interface types {
+    /// Content types that can appear in messages.
+    variant content {
+        text(text-content),
+        image(image-content),
+        thinking(thinking-content),
+        tool-call(tool-call-content),
+        video(video-content),
+        audio(audio-content),
+    }
+
+    record text-content {
+        text: string,
+        text-signature: option<string>,
+    }
+
+    record image-content {
+        data: list<u8>,
+        mime-type: string,
+    }
+
+    record thinking-content {
+        thinking: string,
+        thinking-signature: option<string>,
+        redacted: bool,
+    }
+
+    record tool-call-content {
+        id: string,
+        name: string,
+        arguments-json: string,
+        thought-signature: option<string>,
+    }
+
+    record video-content {
+        data: list<u8>,
+        mime-type: string,
+    }
+
+    record audio-content {
+        data: list<u8>,
+        mime-type: string,
+    }
+
+    /// Stop reasons for assistant messages.
+    enum stop-reason {
+        stop,
+        length,
+        tool-use,
+        error,
+        aborted,
+        interrupted,
+    }
+
+    /// Token usage information.
+    record usage {
+        input-tokens: u64,
+        output-tokens: u64,
+        cache-read-tokens: u64,
+        cache-write-tokens: u64,
+        total-tokens: u64,
+        cost-input: f64,
+        cost-output: f64,
+        cost-cache-read: f64,
+        cost-cache-write: f64,
+        cost-total: f64,
+    }
+
+    /// A user message in the conversation.
+    record user-message {
+        content-text: option<string>,
+        content-parts: option<list<content>>,
+        timestamp-ms: u64,
+    }
+
+    /// An assistant (LLM) response message.
+    record assistant-message {
+        content: list<content>,
+        api: string,
+        provider: string,
+        model-id: string,
+        response-id: option<string>,
+        usage: usage,
+        stop-reason: stop-reason,
+        error-message: option<string>,
+        timestamp-ms: u64,
+    }
+
+    /// A tool execution result message.
+    record tool-result-message {
+        tool-call-id: string,
+        tool-name: string,
+        content: list<content>,
+        details-json: option<string>,
+        is-error: bool,
+        timestamp-ms: u64,
+    }
+
+    /// Union of all message types.
+    variant message {
+        user(user-message),
+        assistant(assistant-message),
+        tool-result(tool-result-message),
+    }
+
+    /// Tool definition for LLM function calling.
+    record tool-definition {
+        name: string,
+        description: string,
+        parameters-json-schema: string,
+    }
+
+    /// Thinking level for reasoning models.
+    enum thinking-level {
+        off,
+        minimal,
+        low,
+        medium,
+        high,
+        xhigh,
+    }
+
+    /// Model capabilities and metadata.
+    record model-info {
+        id: string,
+        name: string,
+        api: string,
+        provider: string,
+        base-url: string,
+        reasoning: bool,
+        input-modalities: list<string>,
+        cost-input: f64,
+        cost-output: f64,
+        cost-cache-read: f64,
+        cost-cache-write: f64,
+        context-window: u64,
+        max-tokens: u64,
+    }
+}
+
+/// Extension lifecycle interface that plugins implement.
+interface extension {
+    use types.{
+        message, assistant-message, tool-definition,
+        tool-call-content, tool-result-message, model-info,
+        thinking-level,
+    };
+
+    /// Configuration passed to the extension on startup.
+    record extension-config {
+        extension-id: string,
+        extension-dir: string,
+        working-dir: string,
+    }
+
+    /// Context available during tool call hooks.
+    record tool-call-context {
+        assistant-message: assistant-message,
+        tool-call: tool-call-content,
+        arguments-json: string,
+    }
+
+    /// Result of the before-tool-call hook.
+    record tool-call-decision {
+        block: bool,
+        reason: option<string>,
+    }
+
+    /// Context available after tool execution.
+    record tool-result-context {
+        assistant-message: assistant-message,
+        tool-call: tool-call-content,
+        arguments-json: string,
+        result: tool-result-message,
+        is-error: bool,
+    }
+
+    /// Override fields for tool results.
+    record tool-result-override {
+        content-json: option<string>,
+        details-json: option<string>,
+        is-error: option<bool>,
+    }
+
+    /// Autocomplete suggestion item.
+    record autocomplete-item {
+        value: string,
+        label: string,
+        description: option<string>,
+    }
+
+    /// Called when the extension is loaded. Return error string to abort.
+    on-init: func(config: extension-config) -> result<_, string>;
+
+    /// Called when the extension is unloaded.
+    on-destroy: func();
+
+    /// Called before a tool is executed. Can block the call.
+    before-tool-call: func(ctx: tool-call-context) -> option<tool-call-decision>;
+
+    /// Called after a tool finishes. Can override the result.
+    after-tool-call: func(ctx: tool-result-context) -> option<tool-result-override>;
+
+    /// Called when a new message is added to the conversation.
+    on-message: func(msg: message) -> list<message>;
+
+    /// Called to get autocomplete suggestions for the @ prefix.
+    get-completions: func(prefix: string) -> list<autocomplete-item>;
+}
+
+/// Host functions that extensions can call back into.
+interface host {
+    use types.{tool-definition, message, model-info};
+
+    /// Register a custom tool with the host.
+    register-tool: func(tool: tool-definition);
+
+    /// Unregister a previously registered tool.
+    unregister-tool: func(name: string);
+
+    /// Log a message at the given level.
+    log: func(level: string, message: string);
+
+    /// Read a file relative to the working directory.
+    read-file: func(path: string) -> result<list<u8>, string>;
+
+    /// Write a file relative to the working directory.
+    write-file: func(path: string, data: list<u8>) -> result<_, string>;
+
+    /// Get the current model info.
+    get-current-model: func() -> option<model-info>;
+
+    /// Get all messages in the current conversation.
+    get-messages: func() -> list<message>;
+}
+
+/// The world that plugins target.
+world pi-extension {
+    import host;
+    export extension;
+}

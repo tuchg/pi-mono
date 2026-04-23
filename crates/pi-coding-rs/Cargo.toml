@@ -1,0 +1,38 @@
+[package]
+name = "pi-coding-rs"
+description = "Interactive coding agent CLI — Rust port of @mariozechner/pi-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[lib]
+name = "pi_coding_rs"
+path = "src/lib.rs"
+
+[dependencies]
+pi-ai-rs = { workspace = true }
+pi-agent-rs = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+chrono = { workspace = true }
+tokio-util = { workspace = true }
+glob = "0.3.3"
+
+[dev-dependencies]
+tempfile = "3"
+regex = { workspace = true }
